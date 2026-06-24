@@ -1,0 +1,14 @@
+# Env files
+.env
+.env.*
+.env.local
+
+# Tauri build output
+src-tauri/target/
+
+# Node
+node_modules/
+dist/
+
+# macOS
+.DS_Store
