@@ -157,6 +157,11 @@ const MAX_DIALOGUE_FIELDS = 10;
 // Free (non-Pro) plan: number of documents allowed before Pro/account is required.
 const FREE_DOC_LIMIT = 3;
 
+// Free (non-Pro) plan: number of uploaded images allowed PER PROJECT on the web
+// (across record assets, world-map images, and timeline covers) before Pro is
+// required. Desktop is always unlimited. Change this single number to taste.
+const FREE_PROJECT_ASSET_LIMIT = 3;
+
 // Transparency widget (web, free tier): rough monthly running costs + current
 // earnings. Edit these as the real numbers change.
 const MONTHLY_COSTS: { label: string; amount: number; color: string; note?: string }[] = [
@@ -653,6 +658,28 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     return false;
   };
 
+  // Gate image uploads on the free web plan: total uploaded images per project
+  // (record assets + world-map images + timeline covers) is capped; over the cap we
+  // prompt to upgrade. Desktop and Pro are unlimited. Pass `incoming` = 0 for a
+  // replacement (no net new asset). Returns true if the upload may proceed.
+  const requireAssetCapacity = async (incoming: number): Promise<boolean> => {
+    if (isDesktop || incoming <= 0 || profile?.is_pro || !project) return true;
+    let current = 0;
+    for (const c of project.collections ?? []) {
+      for (const r of c.rows ?? []) current += r.assets?.length ?? 0;
+    }
+    current += Object.keys((project.view as any)?.timelineCovers ?? {}).length;
+    if (current + incoming <= FREE_PROJECT_ASSET_LIMIT) return true;
+    const ok = await appModal.confirm({
+      title: "Pro feature",
+      message: `The free plan includes up to ${FREE_PROJECT_ASSET_LIMIT} uploaded images per project. Upgrade to Pro for unlimited uploads on the web, or use the desktop app, which is always free and unlimited.`,
+      confirmText: "Upgrade to Pro",
+      cancelText: "Not now",
+    });
+    if (ok) goPro();
+    return false;
+  };
+
   /** ---------- Theme ---------- */
   type ThemeMode = "dark" | "light" | "system";
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -1057,6 +1084,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const addAssetsToEntity = async (collectionId: Id, rowId: Id, files: FileList | null) => {
     if (!files || !project || !projectRowId || !userId) return;
     if (!requireAccount("upload assets")) return;
+    if (!(await requireAssetCapacity(files.length))) return;
 
     // Reveal the Assets sidebar once the user has assets to see.
     if (files.length > 0) setShowAssetsTree(true);
@@ -5714,6 +5742,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const uploadTimelineCover = async (beat: number, file: File) => {
     if (!project || !projectRowId || !userId) return;
     if (!requireAccount("upload assets")) return;
+    const replacingCover = !!(project.view as any)?.timelineCovers?.[beat];
+    if (!(await requireAssetCapacity(replacingCover ? 0 : 1))) return;
 
     const safeName = file.name.replace(/[^\w.-]/g, "_");
     const uploadFile = isDesktop ? file : await compressImageForWeb(file);
@@ -5827,6 +5857,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const uploadWorldMapImage = async (file: File, nameCtx?: WorldNameCtx) => {
     if (!project || !projectRowId || !userId) return;
     if (!requireAccount("create a map")) return;
+    if (!(await requireAssetCapacity(1))) return;
 
     const safeName = sanitizeSegment(file.name) || "map_image";
     const assetId = crypto.randomUUID();
