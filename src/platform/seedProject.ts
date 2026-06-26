@@ -44,10 +44,12 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
   const locationsId = crypto.randomUUID();
   const itemsId = crypto.randomUUID();
 
-  // Character record ids (dialogue references rows by their internal id).
+  // Record ids referenced by entity links + conditions (rows are referenced by id).
   const ariaRowId = crypto.randomUUID();
   const theronRowId = crypto.randomUUID();
   const veskRowId = crypto.randomUUID();
+  const emberfallRowId = crypto.randomUUID();
+  const cloakRowId = crypto.randomUUID();
 
   // Rich, formatted tutorial (headings + bold). `content` mirrors it as plain
   // text for search/export; there are no entity links here so exact offset
@@ -72,18 +74,18 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
 
     heading('h2', 'Linking text to records'),
     para(
-      txt('Select any text in a document, or type a forward slash, to link it to a record in one of your tables. '),
-      txt('Linked text stays connected to that record', true),
-      txt(', so your writing and your game data stay in sync.'),
+      txt('Select any text in a document, or type a forward slash, to link it to a record in one of your tables. You can link items, objects, people, places, and more. '),
+      txt('Linked text shows the record’s name and stays connected to it', true),
+      txt(', so if you rename the record your writing updates everywhere it is linked.'),
     ),
 
-    heading('h2', 'Dialogue'),
+    heading('h2', 'Conditions'),
     para(
-      txt('Wrap a line in quotation marks to turn it into a dialogue line, then choose the character who says it. Each line can carry fields like '),
+      txt('Conditions map your own fields (like '),
       txt('Stage', true),
       txt(' and '),
       txt('Interaction', true),
-      txt(', which helps with branching and sequencing in your game. Open Chapter 1 in the Story folder, then check the Dialogue panel on the left to see a couple of example lines.'),
+      txt(') to a result, such as a line of text, a value, or a record’s column value. This helps with branching and sequencing in your game. Open the Conditions panel on the left to see the example Dialogue condition, or create your own.'),
     ),
 
     heading('h2', 'Assets'),
@@ -122,10 +124,10 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
     'The Database panel holds your structured game data as tables. Each table (for example Characters) has records, and each record has fields you define. Take a look at the Characters table, plus the Locations and Items tables grouped inside the World folder.',
     '',
     'Linking text to records',
-    'Select any text in a document, or type a forward slash, to link it to a record in one of your tables. Linked text stays connected to that record, so your writing and your game data stay in sync.',
+    'Select any text in a document, or type a forward slash, to link it to a record in one of your tables. You can link items, objects, people, places, and more. Linked text shows the record’s name and stays connected to it, so if you rename the record your writing updates everywhere it is linked.',
     '',
-    'Dialogue',
-    'Wrap a line in quotation marks to turn it into a dialogue line, then choose the character who says it. Each line can carry fields like Stage and Interaction, which helps with branching and sequencing in your game. Open Chapter 1 in the Story folder, then check the Dialogue panel on the left to see a couple of example lines.',
+    'Conditions',
+    'Conditions map your own fields (like Stage and Interaction) to a result, such as a line of text, a value, or a record’s column value. This helps with branching and sequencing in your game. Open the Conditions panel on the left to see the example Dialogue condition, or create your own.',
     '',
     'Assets',
     'Attach images and files to a record, such as a character portrait or a map image. Everything you upload shows up in the Assets panel.',
@@ -168,20 +170,22 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
     para(txt('By the time they crossed the ridge, the first stars had appeared, and the real journey had only begun.')),
   ]);
 
-  // Real dialogue links: an entity link wraps the quoted span (Lexical joins
-  // blocks with "\n\n", which chapterContent mirrors, so indexOf offsets align),
-  // and each dialogue entry references its link so it shows highlighted in the
-  // editor and is clickable from the Dialogue panel.
-  const ariaQuote = '"We should reach the gate before nightfall,"';
-  const theronQuote = '"Stay close. These woods are not as empty as they look,"';
-  const ariaLinkId = crypto.randomUUID();
-  const theronLinkId = crypto.randomUUID();
-  const ariaStart = chapterContent.indexOf(ariaQuote);
-  const theronStart = chapterContent.indexOf(theronQuote);
+  // Demo entity links wrap the *nouns* in the prose (characters, a location, an
+  // item) so they link to records in the tables. (Lexical joins blocks with "\n\n",
+  // which chapterContent mirrors, so indexOf offsets align.) `needle` locates a
+  // unique span and the link wraps its first `wordLen` characters.
+  const ariaQuote = 'We should reach the gate before nightfall,';
+  const theronQuote = 'Stay close. These woods are not as empty as they look,';
+  const mkLink = (collectionId: string, entityId: string, needle: string, wordLen: number) => {
+    const start = chapterContent.indexOf(needle);
+    return start < 0 ? null : { id: crypto.randomUUID(), docId: chapterDocId, collectionId, entityId, start, end: start + wordLen };
+  };
   const chapterEntityLinks = [
-    { id: ariaLinkId, docId: chapterDocId, collectionId: charactersId, entityId: ariaRowId, start: ariaStart, end: ariaStart + ariaQuote.length },
-    { id: theronLinkId, docId: chapterDocId, collectionId: charactersId, entityId: theronRowId, start: theronStart, end: theronStart + theronQuote.length },
-  ].filter((l) => l.start >= 0);
+    mkLink(charactersId, ariaRowId, 'Aria pulled', 4),       // "Aria"
+    mkLink(itemsId, cloakRowId, 'cloak', 5),                  // "cloak"
+    mkLink(charactersId, theronRowId, 'Theron, the old', 6),  // "Theron"
+    mkLink(locationsId, emberfallRowId, 'Emberfall flickered', 9), // "Emberfall"
+  ].filter((l): l is NonNullable<typeof l> => l !== null);
 
   return {
     id: crypto.randomUUID(),
@@ -253,7 +257,7 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
         ],
         rows: [
           {
-            id: crypto.randomUUID(),
+            id: emberfallRowId,
             values: { id: 'EMBERFALL', name: 'Emberfall', type: 'City', description: 'A walled city of lamplight and trade, built where three roads meet.' },
             assets: [],
           },
@@ -284,8 +288,8 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
             assets: [],
           },
           {
-            id: crypto.randomUUID(),
-            values: { id: 'HEALING_TONIC', name: 'Healing Tonic', type: 'Consumable', description: 'A bitter draught that knits small wounds closed in moments.' },
+            id: cloakRowId,
+            values: { id: 'TRAVELERS_CLOAK', name: "Traveler's Cloak", type: 'Apparel', description: 'A weathered wool cloak, warm against the mountain wind.' },
             assets: [],
           },
         ],
@@ -293,31 +297,31 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
     ],
     documentFolders: [['Tutorial'], ['Story']],
     collectionFolders: [['World']],
-    dialogueEntries: [
+    datasets: [
       {
-        id: `dlg_${ariaLinkId}`,
-        linkId: ariaLinkId,
-        speakerCollectionId: charactersId,
-        speakerEntityId: ariaRowId,
-        characterId: ariaRowId,
-        documentId: chapterDocId,
-        fields: { STAGE: 1, INTERACTION: 1 },
-        text: ariaQuote.slice(1, -1),
+        id: 'dialogue',
+        name: 'Dialogue',
+        fieldDefs: [
+          { id: 'STAGE', label: 'Stage', type: 'number', defaultValue: 1 },
+          { id: 'INTERACTION', label: 'Interaction', type: 'number', defaultValue: 1 },
+        ],
+        entries: [
+          {
+            id: crypto.randomUUID(),
+            subjectCollectionId: charactersId,
+            subjectEntityId: ariaRowId,
+            fields: { STAGE: 1, INTERACTION: 1 },
+            result: { kind: 'text', value: ariaQuote },
+          },
+          {
+            id: crypto.randomUUID(),
+            subjectCollectionId: charactersId,
+            subjectEntityId: theronRowId,
+            fields: { STAGE: 1, INTERACTION: 2 },
+            result: { kind: 'text', value: theronQuote },
+          },
+        ],
       },
-      {
-        id: `dlg_${theronLinkId}`,
-        linkId: theronLinkId,
-        speakerCollectionId: charactersId,
-        speakerEntityId: theronRowId,
-        characterId: theronRowId,
-        documentId: chapterDocId,
-        fields: { STAGE: 1, INTERACTION: 2 },
-        text: theronQuote.slice(1, -1),
-      },
-    ],
-    dialogueFieldDefs: [
-      { id: 'STAGE', label: 'Stage', type: 'number', defaultValue: 1 },
-      { id: 'INTERACTION', label: 'Interaction', type: 'number', defaultValue: 1 },
     ],
     timelineLabels: [],
     worldMapDocPins: [],

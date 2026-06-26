@@ -69,7 +69,7 @@ export function richContentToMarkdown(
 
   const inline = (node: any): string => {
     const t = String(node?.type ?? '');
-    if (t === 'text') {
+    if (t === 'text' || t === 'entity-link') {
       const raw = String(node?.text ?? '');
       const start = offset;
       offset += raw.length;

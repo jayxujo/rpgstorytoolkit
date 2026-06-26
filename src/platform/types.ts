@@ -23,6 +23,9 @@ export interface ProjectSummary {
 }
 
 export interface Platform {
+  // Open an external URL in the OS default browser.
+  openExternal(url: string): Promise<void>;
+
   // Auth
   getUser(): Promise<PlatformUser | null>;
   signOut(): Promise<void>;
@@ -34,6 +37,15 @@ export interface Platform {
   // `preferredId` (web) loads that specific project if it belongs to the user.
   loadProject(userId: string, preferredId?: string): Promise<LoadedProject | null>;
   saveProject(rowId: string, project: Project): Promise<void>;
+
+  // Optimistic-concurrency save (web only). Writes only if the row's current
+  // updated_at still equals `expectedUpdatedAt` (pass null to force-write). Returns
+  // whether it wrote and the new server updated_at. Used by safe auto-sync.
+  saveProjectIfUnchanged?(
+    rowId: string,
+    project: Project,
+    expectedUpdatedAt: string | null
+  ): Promise<{ ok: boolean; updatedAt: string | null }>;
   // Multi-project (web). Desktop is vault-based and stubs these.
   listProjects(userId: string): Promise<ProjectSummary[]>;
   createProject(userId: string, project: Project): Promise<LoadedProject>;

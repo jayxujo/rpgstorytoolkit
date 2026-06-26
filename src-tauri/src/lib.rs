@@ -92,6 +92,38 @@ fn prune_empty_dirs(path: String) -> Result<(), String> {
     Ok(())
 }
 
+// Open an http(s) URL in the user's default browser (no extra plugin needed).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Only http(s) URLs are allowed".into());
+    }
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+    #[cfg(target_os = "linux")]
+    let spawned = std::process::Command::new("xdg-open").arg(&url).spawn();
+    spawned.map(|_| ()).map_err(|e| e.to_string())
+}
+
+// Non-recursive list of entry names (files + dirs) directly inside `path`.
+#[tauri::command]
+fn list_dir(path: String) -> Result<Vec<String>, String> {
+    let p = Path::new(&path);
+    if !p.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(p).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -107,7 +139,9 @@ pub fn run() {
             delete_file,
             rename_path,
             trash_path,
-            prune_empty_dirs
+            prune_empty_dirs,
+            list_dir,
+            open_url
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {

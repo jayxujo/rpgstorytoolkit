@@ -22,8 +22,11 @@ import type {
   AssetFile,
   Id,
   EntityLink,
-  DialogueEntry,
   DialogueFieldDef,
+  Dataset,
+  DatasetEntry,
+  DatasetResult,
+  DatasetFieldType,
   WorldMapDocPin,
   WorldMapLabelPin,
   WorldMapEntry,
@@ -66,7 +69,25 @@ import {
 } from "./platform/worldMapBridge";
 import { parseTitlePath, docVaultSegments, colVaultSegments, toSlug } from "./platform/slugify";
 import { richContentToMarkdown } from "./platform/docMarkdown";
-import { buildNestedDialogue, dialogueCharKey } from "./dialogueExport";
+import {
+  buildDatasetFile,
+  datasetSubjectKey,
+  DIALOGUE_DATASET_ID,
+} from "./dialogueExport";
+import DatasetView from "./DatasetView";
+import type { LinkEditorApi } from "./StoryEditor";
+import {
+  migrateDocToChips,
+  reconcileDocChips,
+  richContentHasChips,
+  isSingleWord,
+  type LabelResolver,
+} from "./editor/linkEngine";
+import {
+  DEFAULT_DIALOGUE_FIELD_DEFS,
+  ensureFieldValues as ensureDialogueFieldValues,
+  summarizeResult,
+} from "./datasetFields";
 import JSZip from "jszip";
 import { buildProjectArchive, readProjectArchive, collectAssetPaths, PROJECT_FILE_EXT } from "./projectTransfer";
 
@@ -120,39 +141,6 @@ const archiveActiveWorldMap = (p: Project): { worldMaps: WorldMapEntry[]; active
   return { worldMaps: maps, activeId };
 };
 
-const stripDialogueQuotes = (raw: string): string => {
-  const t = raw.trim();
-  if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) return t.slice(1, -1);
-  return t;
-};
-
-const makeDialogueFieldId = (label: string, fallback = "FIELD"): string => {
-  const cleaned = String(label || "")
-    .trim()
-    .replace(/[^a-zA-Z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .toUpperCase();
-
-  return cleaned || fallback;
-};
-
-const makeUniqueDialogueFieldId = (baseId: string, used: Set<string>): string => {
-  let next = baseId;
-  let n = 2;
-  while (used.has(next)) {
-    next = `${baseId}_${n}`;
-    n++;
-  }
-  used.add(next);
-  return next;
-};
-
-const DEFAULT_DIALOGUE_FIELD_DEFS: DialogueFieldDef[] = [
-  { id: "STAGE", label: "Stage", type: "number", defaultValue: 1 },
-  { id: "INTERACTION", label: "Interaction", type: "number", defaultValue: 1 },
-];
-
-const MAX_DIALOGUE_FIELDS = 10;
 
 // Free (non-Pro) plan: number of documents allowed before Pro/account is required.
 const FREE_DOC_LIMIT = 3;
@@ -302,6 +290,26 @@ const hashString = (str: string): string => {
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 };
 
+// Serialize a project for the "unpushed changes" detector. Per-device UI prefs in
+// `view` (layout mode, panel sizes, collapse state, active dataset, etc.) are NOT
+// content and shouldn't flag a project as out of sync — strip them so a freshly
+// created/synced project reads as clean and local UI tweaks don't nag. Everything
+// content-bearing (docs, tables, conditions, world maps, timeline, wiki, …) stays.
+const syncContentString = (p: Project): string => {
+  const { view, ...rest } = p as any;
+  let v = view;
+  if (view && typeof view === "object") {
+    v = { ...view };
+    for (const k of [
+      "uiLayoutMode", "uiFocusView", "uiShowAssetsTree", "uiShowDialogueTree",
+      "uiShowLeftPanel", "uiShowMiddlePanel", "uiShowRightPanel",
+      "uiPanelSizes", "uiTimelineHeight", "uiCollapsedDocumentGroups",
+      "uiCollapsedCollectionGroups", "uiColumnWidths", "activeDatasetId",
+    ]) delete (v as any)[k];
+  }
+  return JSON.stringify({ ...rest, view: v });
+};
+
 // Compress/resize an image for WEB storage only (cuts Supabase storage + egress).
 // Keeps the original filename, never enlarges, skips non-raster/animated formats,
 // and falls back to the original on any failure. Not used for desktop vaults or
@@ -341,51 +349,30 @@ const guessImageMime = (name: string): string => {
   return map[ext] ?? "image/*";
 };
 
-const getDialogueFieldDefs = (p?: Project | null): DialogueFieldDef[] => {
-  const defs = p?.dialogueFieldDefs;
-  return Array.isArray(defs) && defs.length > 0 ? defs : DEFAULT_DIALOGUE_FIELD_DEFS;
-};
+const getDatasets = (p?: Project | null): Dataset[] => (Array.isArray(p?.datasets) ? p!.datasets : []);
 
-const buildDefaultDialogueFieldValues = (defs: DialogueFieldDef[]): Record<string, string | number> => {
-  const out: Record<string, string | number> = {};
-  for (const def of defs) {
-    if (def.defaultValue !== undefined) {
-      out[def.id] = def.defaultValue;
-    } else {
-      out[def.id] = def.type === "number" ? 1 : def.type === "bool" ? "false" : "";
-    }
-  }
-  return out;
-};
+const newDatasetId = () => `ds_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+const newDatasetEntryId = () => `de_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-const ensureDialogueFieldValues = (
-  defs: DialogueFieldDef[],
-  incoming: Record<string, any> | null | undefined
-): Record<string, string | number> => {
-  const base = incoming && typeof incoming === "object" ? incoming : {};
-  const out: Record<string, string | number> = {};
-  for (const def of defs) {
-    const raw = (base as any)[def.id];
-    if (raw === undefined || raw === null || raw === "") {
-      out[def.id] =
-        def.defaultValue !== undefined
-          ? def.defaultValue
-          : def.type === "number"
-            ? 1
-            : def.type === "bool"
-              ? "false"
-              : "";
-    } else {
-      out[def.id] =
-        def.type === "number"
-          ? Math.max(1, Number(raw) || 1)
-          : def.type === "bool"
-            ? raw === true || raw === "true" ? "true" : "false"
-            : String(raw);
-    }
-  }
-  return out;
-};
+// Keep dataset entries referentially clean when a collection or record is deleted:
+// drop entries whose column-result target was deleted, and clear dangling subject refs.
+const scrubDatasetRefs = (datasets: Dataset[], del: { collectionId?: Id; rowId?: Id }): Dataset[] =>
+  (datasets ?? []).map((ds) => ({
+    ...ds,
+    entries: ds.entries
+      .filter((e) => {
+        if (e.result.kind !== "column") return true;
+        if (del.collectionId && e.result.collectionId === del.collectionId) return false;
+        if (del.rowId && e.result.entityId === del.rowId) return false;
+        return true;
+      })
+      .map((e) => {
+        const subjGone =
+          (del.collectionId && e.subjectCollectionId === del.collectionId) ||
+          (del.rowId && e.subjectEntityId === del.rowId);
+        return subjGone ? { ...e, subjectCollectionId: undefined, subjectEntityId: undefined } : e;
+      }),
+  }));
 
 /** =========================
  *  Profile types
@@ -549,6 +536,15 @@ const AssetTypeBadge: React.FC<{ name: string; mime: string; size?: number }> = 
 const IconChat: React.FC = () => (
   <svg {...svgProps} width={14} height={14}>
     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+  </svg>
+);
+const IconNewDataset: React.FC = () => (
+  <svg {...svgProps}>
+    <line x1="3" x2="13" y1="6" y2="6" />
+    <line x1="3" x2="13" y1="12" y2="12" />
+    <line x1="3" x2="9" y1="18" y2="18" />
+    <line x1="17" x2="17" y1="14" y2="20" />
+    <line x1="14" x2="20" y1="17" y2="17" />
   </svg>
 );
 const IconAddColumn: React.FC = () => (
@@ -844,16 +840,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   }, [fileMenuOpen]);
 
 
-  const [dialogueFieldsModalOpen, setDialogueFieldsModalOpen] = useState(false);
-  const [dialogueFieldDefsDraft, setDialogueFieldDefsDraft] = useState<DialogueFieldDef[]>(
-    DEFAULT_DIALOGUE_FIELD_DEFS
-  );
-
-  const quoteDialogueFirstFieldRef = useRef<HTMLInputElement | null>(null);
-
   /** ---------- Export dialogue (settings modal) ---------- */
   const [exportDialogueModalOpen, setExportDialogueModalOpen] = useState(false);
-  const [exportDialogueDocIds, setExportDialogueDocIds] = useState<Id[]>([]);
+  const [exportDatasetIds, setExportDatasetIds] = useState<Id[]>([]);
 
   /** ---------- Export collections/documents (format modals) ---------- */
   const [exportCollectionsModalOpen, setExportCollectionsModalOpen] = useState(false);
@@ -901,6 +890,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
   // Autosave (debounced)
   const AUTO_SAVE_DELAY_MS = 10000;
+  // Auto-sync fires a bit after a save settles, so a burst of edits pushes once.
+  const AUTO_SYNC_DELAY_MS = 5000;
 
   const [isDirty, _setIsDirty] = useState(false);
   const dirtyRef = useRef(false);
@@ -912,6 +903,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const lastSavedJsonRef = useRef<string | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
   const pendingAutoSaveRef = useRef(false);
+
+  // Desktop: auto-push to the linked web project shortly after each save (Pro only).
+  // Per-device preference (applies to all synced projects on this machine).
+  // On by default (per device); only off if the user explicitly turned it off.
+  const [autoSyncOnSave, setAutoSyncOnSave] = useState<boolean>(() => {
+    try { return localStorage.getItem("evenstory_autosync") !== "0"; } catch { return true; }
+  });
+  const autoSyncTimerRef = useRef<number | null>(null);
+  const autoSyncingRef = useRef(false);
 
   const projectRef = useRef<Project | null>(null);
   useLayoutEffect(() => {
@@ -1329,11 +1329,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   // Layout: "focus" shows the sidebar + one editor (story OR collection); "dual"
   // shows both side by side. The sidebar is always present.
   const [layoutMode, setLayoutMode] = useState<"focus" | "dual">("focus");
-  const [focusView, setFocusView] = useState<"doc" | "collection">("doc");
+  const [focusView, setFocusView] = useState<"doc" | "collection" | "dataset">("doc");
   const [layoutModalOpen, setLayoutModalOpen] = useState(false);
+  const [activeDatasetId, setActiveDatasetId] = useState<Id | null>(null);
   const showLeftPanel = true;
   const showMiddlePanel = layoutMode === "dual" || focusView === "doc";
-  const showRightPanel = layoutMode === "dual" || focusView === "collection";
+  // The right panel hosts either the table/database editor or the Dataset view.
+  const rightShowsDataset = focusView === "dataset";
+  const showRightPanel = layoutMode === "dual" || focusView === "collection" || focusView === "dataset";
 
   // ✅ Timeline overlay height (draggable)
   const defaultTimelineHeight = useMemo(() => {
@@ -1360,7 +1363,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const v = project.view ?? {};
     const mode = v.uiLayoutMode === "dual" ? "dual" : "focus";
     setLayoutMode(mode);
-    setFocusView(v.uiFocusView === "collection" ? "collection" : "doc");
+    setFocusView(v.uiFocusView === "collection" ? "collection" : v.uiFocusView === "dataset" ? "dataset" : "doc");
+    setActiveDatasetId(v.activeDatasetId ?? null);
     setShowAssetsTree(v.uiShowAssetsTree === true);
     setShowDialogueTree(v.uiShowDialogueTree === true);
 
@@ -1399,6 +1403,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         v.uiFocusView === focusView &&
         v.uiShowAssetsTree === showAssetsTree &&
         v.uiShowDialogueTree === showDialogueTree &&
+        (v.activeDatasetId ?? null) === (activeDatasetId ?? null) &&
         (v as any).uiTimelineHeight === nextH &&
         JSON.stringify((v as any).uiPanelSizes) === JSON.stringify(panelSizes)
       ) {
@@ -1413,12 +1418,13 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           uiFocusView: focusView,
           uiShowAssetsTree: showAssetsTree,
           uiShowDialogueTree: showDialogueTree,
+          activeDatasetId: activeDatasetId ?? undefined,
           uiTimelineHeight: nextH,
           uiPanelSizes: panelSizes.length > 0 ? panelSizes : (v as any).uiPanelSizes,
         },
       };
     });
-  }, [project?.id, layoutMode, focusView, showAssetsTree, showDialogueTree, timelineHeight, panelSizes, clampTimelineHeight]);
+  }, [project?.id, layoutMode, focusView, showAssetsTree, showDialogueTree, activeDatasetId, timelineHeight, panelSizes, clampTimelineHeight]);
 
   // ✅ Keep timeline height within the viewport on window resize
   useEffect(() => {
@@ -1619,34 +1625,24 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const [linkPopoverAnchorRect, setLinkPopoverAnchorRect] = useState<AnchorRect | null>(null);
   const [caretLinkId, setCaretLinkId] = useState<Id | null>(null);
 
-  // Programmatic "scroll the editor to this link" request (from the sidebar dialogue tree).
-  const [scrollToLinkId, setScrollToLinkId] = useState<Id | null>(null);
-  const [scrollNonce, setScrollNonce] = useState<number>(0);
-
   const [linkingCollectionId, setLinkingCollectionId] = useState<Id | "">("");
   const [linkingEntityId, setLinkingEntityId] = useState<Id | "">("");
   const [editingLinkId, setEditingLinkId] = useState<Id | null>(null);
 
-  const [linkingIsDialogue, setLinkingIsDialogue] = useState<boolean>(false);
-  const [linkingDialogueFields, setLinkingDialogueFields] = useState<Record<string, string | number>>(
-    buildDefaultDialogueFieldValues(DEFAULT_DIALOGUE_FIELD_DEFS)
-  );
-
-  /** ---------- Quote dialogue link flow (closing quote trigger) ---------- */
-  const [quoteDialogueModalOpen, setQuoteDialogueModalOpen] = useState(false);
-  const [quoteDialoguePending, setQuoteDialoguePending] = useState<{
-    start: number;
-    end: number;
-    collectionId: Id;
-    entityId: Id;
-  } | null>(null);
-
-  const [quoteDialogueFields, setQuoteDialogueFields] = useState<Record<string, string | number>>(
-    buildDefaultDialogueFieldValues(DEFAULT_DIALOGUE_FIELD_DEFS)
-  );
-
-
   const [linkingNotice, setLinkingNotice] = useState<string | null>(null);
+
+  // Imperative handle into the live editor for creating/updating/removing link chips.
+  const linkApiRef = useRef<LinkEditorApi | null>(null);
+
+  // Resolve a record's display label (name, id fallback) for link chips.
+  const labelResolver = useCallback<LabelResolver>((collectionId, entityId) => {
+    const col = projectRef.current?.collections.find((c) => c.id === collectionId);
+    const row = col?.rows.find((r) => r.id === entityId);
+    if (!row) return null;
+    return String(row.values["name"] || row.values["id"] || row.id);
+  }, []);
+  const colorResolver = useCallback((collectionId: Id) =>
+    projectRef.current?.collections.find((c) => c.id === collectionId)?.color, []);
 
   /** ---------- Derived ---------- */
   const activeDoc = project?.documents.find((d) => d.id === activeDocId) ?? null;
@@ -1672,10 +1668,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     );
 
   const activeCollection = project?.collections.find((c) => c.id === activeCollectionId) ?? null;
-  const charactersCollection = project?.collections.find((c) => c.kind === "characters") ?? null;
   const timelineEnabled = project?.view?.timelineEnabled ?? false;
   const timelineLabels = project?.timelineLabels ?? [];
-  const dialogueFieldDefs = getDialogueFieldDefs(project);
+  const datasets = getDatasets(project);
+  const activeDataset = datasets.find((d) => d.id === activeDatasetId) ?? datasets[0] ?? null;
 
   const wikiSettings = project?.view?.wiki;
   // The public wiki is web-only; on desktop, treat it as not-published so no
@@ -1743,11 +1739,6 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     return out;
   }, [project, getRowLabel]);
 
-  const dialogueQuoteItems = useMemo(() => {
-    // Dialogue linking should allow any entity from any collection (same pool as `/`)
-    return slashItems;
-  }, [slashItems]);
-
   // ✅ Timeline label click → open entity in right panel (collection + highlight + scroll)
   const openEntityInCollection = useCallback(
     (collectionId: Id, rowId: Id) => {
@@ -1785,35 +1776,76 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     [setFocusView, setActiveCollectionId, setActiveRowId]
   );
 
-  // Sidebar dialogue-tree line click → open the source document in the doc editor and
-  // scroll/highlight the linked text so its values can be edited inline.
-  const navigateToDialogueLine = useCallback(
-    (docId: Id, linkId?: Id) => {
-      if (!docId) return;
+  // Open a dataset in the dedicated Dataset view (focus mode swaps to it; dual mode
+  // shows it in the right panel in place of the table editor).
+  const openDataset = useCallback((id: Id) => {
+    setActiveDatasetId(id);
+    setFocusView("dataset");
+    setTreeSelection(new Set(["dataset:" + id]));
+    treeAnchorRef.current = "dataset:" + id;
+  }, []);
 
-      setActiveDocId(docId);
-      setFocusView("doc");
+  const updateDataset = useCallback((next: Dataset) => {
+    setProject((prev) =>
+      prev ? { ...prev, datasets: getDatasets(prev).map((d) => (d.id === next.id ? next : d)) } : prev
+    );
+  }, []);
 
-      // Expand the document's ancestor folders + select it in the sidebar.
-      const doc = projectRef.current?.documents.find((d) => d.id === docId);
-      const fp = doc?.folderPath ?? [];
-      if (fp.length) {
-        setCollapsedDocumentGroups((prev) => {
-          const next = { ...prev };
-          for (let i = 1; i <= fp.length; i++) next[fp.slice(0, i).join("/")] = false;
-          return next;
-        });
-      }
-      setTreeSelection(new Set(["docitem:" + docId]));
-      treeAnchorRef.current = "docitem:" + docId;
+  const addDataset = useCallback(async () => {
+    const name = await appModal.prompt({
+      title: "New condition",
+      message: "Condition name:",
+      defaultValue: "New condition",
+      placeholder: "Condition name",
+      confirmText: "Create",
+      cancelText: "Cancel",
+    });
+    if (!name || !name.trim()) return;
+    const ds: Dataset = {
+      id: newDatasetId(),
+      name: name.trim(),
+      fieldDefs: DEFAULT_DIALOGUE_FIELD_DEFS.map((d) => ({ ...d })),
+      entries: [],
+    };
+    setProject((prev) => (prev ? { ...prev, datasets: [...getDatasets(prev), ds] } : prev));
+    setActiveDatasetId(ds.id);
+    setFocusView("dataset");
+  }, [appModal]);
 
-      // Ask the editor to scroll to & open the link popover (bump nonce to re-fire on repeats).
-      if (linkId) {
-        setScrollToLinkId(linkId);
-        setScrollNonce((n) => n + 1);
-      }
+  const renameDataset = useCallback(
+    async (id: Id) => {
+      const ds = getDatasets(projectRef.current).find((d) => d.id === id);
+      const name = await appModal.prompt({
+        title: "Rename condition",
+        message: "Condition name:",
+        defaultValue: ds?.name ?? "",
+        confirmText: "Rename",
+        cancelText: "Cancel",
+      });
+      if (!name || !name.trim()) return;
+      setProject((prev) =>
+        prev ? { ...prev, datasets: getDatasets(prev).map((d) => (d.id === id ? { ...d, name: name.trim() } : d)) } : prev
+      );
     },
-    [setFocusView]
+    [appModal]
+  );
+
+  const deleteDataset = useCallback(
+    async (id: Id) => {
+      const ds = getDatasets(projectRef.current).find((d) => d.id === id);
+      const ok = await appModal.confirm({
+        title: "Delete condition?",
+        message: `Delete "${ds?.name ?? "this condition"}" and all its entries? This can't be undone.`,
+        confirmText: "Delete",
+        cancelText: "Cancel",
+        danger: true,
+      });
+      if (!ok) return;
+      setProject((prev) => (prev ? { ...prev, datasets: getDatasets(prev).filter((d) => d.id !== id) } : prev));
+      setActiveDatasetId((cur) => (cur === id ? null : cur));
+      setFocusView((fv) => (fv === "dataset" ? "doc" : fv));
+    },
+    [appModal]
   );
 
   const getCollectionColor = useCallback(
@@ -2036,68 +2068,90 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     return rows;
   }, [project, collapsedAssetGroups, getRowLabel]);
 
-  // Read-only tree for the sidebar Dialogue panel: character -> field values -> lines.
-  const dialogueTreeRows = useMemo(() => {
+  // Sidebar Datasets tree: each dataset is a top-level row; expanding it shows the
+  // entries grouped by subject (if any) then field values, with result summaries at
+  // the leaves. Collapse keys are namespaced by dataset id.
+  const datasetTreeRows = useMemo(() => {
     type Row =
-      | { kind: "char" | "field"; label: string; fieldLabel?: string; path: string[]; depth: number; collapsed: boolean; count: number }
-      | { kind: "line"; text: string; depth: number; key: string; entryId: string; docId: string; linkId?: string };
+      | { kind: "dataset"; datasetId: Id; name: string; collapsed: boolean; count: number }
+      | { kind: "group"; datasetId: Id; label: string; fieldLabel?: string; key: string; depth: number; collapsed: boolean; count: number }
+      | { kind: "leaf"; datasetId: Id; text: string; depth: number; key: string; entryId: string };
     if (!project) return [] as Row[];
 
-    const fieldDefs = project.dialogueFieldDefs ?? [];
+    const rows: Row[] = [];
+    for (const ds of getDatasets(project)) {
+      const dsKey = "ds:" + ds.id;
+      const dsCollapsed = collapsedDialogueGroups[dsKey] ?? true;
+      rows.push({ kind: "dataset", datasetId: ds.id, name: ds.name, collapsed: dsCollapsed, count: ds.entries.length });
+      if (dsCollapsed) continue;
 
-    // Mirror buildNestedDialogue's grouping, but keep the DialogueEntry at each leaf
-    // (instead of just its text) so a clicked line can navigate back to its source.
-    const nested: Record<string, any> = {};
-    for (const entry of project.dialogueEntries ?? []) {
-      const charKey = dialogueCharKey(project, entry);
-      if (fieldDefs.length === 0) {
-        if (!Array.isArray(nested[charKey])) nested[charKey] = [];
-        nested[charKey].push(entry);
-        continue;
-      }
-      if (!nested[charKey] || Array.isArray(nested[charKey])) nested[charKey] = {};
-      let node: any = nested[charKey];
-      for (let i = 0; i < fieldDefs.length; i++) {
-        const val = String(entry.fields?.[fieldDefs[i].id] ?? "");
-        if (i === fieldDefs.length - 1) {
-          if (!Array.isArray(node[val])) node[val] = [];
-          node[val].push(entry);
-        } else {
-          if (!node[val] || Array.isArray(node[val])) node[val] = {};
-          node = node[val];
+      const fieldDefs = ds.fieldDefs ?? [];
+      const hasSubject = ds.entries.some((e) => e.subjectEntityId);
+
+      // Build a nested grouping that keeps the entry at each leaf.
+      const nested: Record<string, any> = {};
+      for (const entry of ds.entries) {
+        const levels: string[] = [];
+        if (hasSubject) levels.push(datasetSubjectKey(project, entry));
+        for (const def of fieldDefs) levels.push(String(entry.fields?.[def.id] ?? ""));
+
+        if (levels.length === 0) {
+          if (!Array.isArray(nested["_"])) nested["_"] = [];
+          nested["_"].push(entry);
+          continue;
+        }
+        let node: any = nested;
+        for (let i = 0; i < levels.length; i++) {
+          const k = levels[i];
+          if (i === levels.length - 1) {
+            if (!Array.isArray(node[k])) node[k] = [];
+            node[k].push(entry);
+          } else {
+            if (!node[k] || Array.isArray(node[k])) node[k] = {};
+            node = node[k];
+          }
         }
       }
-    }
 
-    const countLines = (node: any): number =>
-      Array.isArray(node) ? node.length : Object.values(node).reduce((n: number, c) => n + countLines(c), 0);
+      const countLeaves = (node: any): number =>
+        Array.isArray(node) ? node.length : Object.values(node).reduce((n: number, c) => n + countLeaves(c), 0);
 
-    const rows: Row[] = [];
-    const walk = (node: any, pathSoFar: string[], depth: number) => {
-      if (Array.isArray(node)) {
-        node.forEach((entry: any, i: number) =>
+      const walk = (node: any, pathSoFar: string[], depth: number) => {
+        if (Array.isArray(node)) {
+          node.forEach((entry: DatasetEntry, i: number) =>
+            rows.push({
+              kind: "leaf",
+              datasetId: ds.id,
+              text: summarizeResult(project.collections, entry.result),
+              depth: depth + 1,
+              key: ds.id + "/" + pathSoFar.join("/") + ":" + i,
+              entryId: String(entry.id),
+            })
+          );
+          return;
+        }
+        for (const key of Object.keys(node)) {
+          const path = [...pathSoFar, key];
+          const fullKey = ds.id + "::" + path.join("/");
+          const collapsed = collapsedDialogueGroups[fullKey] ?? true;
+          // depth 0 = subject (when present); otherwise the field at this level.
+          const fieldIdx = hasSubject ? depth - 1 : depth;
+          const fieldLabel = !(hasSubject && depth === 0) ? fieldDefs[fieldIdx]?.label : undefined;
           rows.push({
-            kind: "line",
-            text: String(entry.text ?? ""),
-            depth,
-            key: pathSoFar.join("/") + ":" + i,
-            entryId: String(entry.id),
-            docId: String(entry.documentId),
-            linkId: entry.linkId ? String(entry.linkId) : undefined,
-          })
-        );
-        return;
-      }
-      for (const key of Object.keys(node)) {
-        const path = [...pathSoFar, key];
-        const collapsed = collapsedDialogueGroups[path.join("/")] ?? true; // collapsed by default
-        // For field levels, the field is fieldDefs[depth - 1] (depth 0 = character).
-        const fieldLabel = depth >= 1 ? fieldDefs[depth - 1]?.label : undefined;
-        rows.push({ kind: depth === 0 ? "char" : "field", label: key, fieldLabel, path, depth, collapsed, count: countLines(node[key]) });
-        if (!collapsed) walk(node[key], path, depth + 1);
-      }
-    };
-    walk(nested, [], 0);
+            kind: "group",
+            datasetId: ds.id,
+            label: key === "_" ? "(all)" : key,
+            fieldLabel,
+            key: fullKey,
+            depth: depth + 1,
+            collapsed,
+            count: countLeaves(node[key]),
+          });
+          if (!collapsed) walk(node[key], path, depth + 1);
+        }
+      };
+      walk(nested, [], 0);
+    }
     return rows;
   }, [project, collapsedDialogueGroups]);
 
@@ -2318,8 +2372,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const textOf = (n: any): string => {
       const t = nodeType(n);
 
-      // Text nodes
-      if (t === "text") return String(n?.text ?? "");
+      // Text nodes (entity-link chips are TextNode subclasses: same text payload)
+      if (t === "text" || t === "entity-link") return String(n?.text ?? "");
 
       // Line breaks (Lexical sometimes uses "linebreak")
       if (t === "linebreak") return "\n";
@@ -2377,7 +2431,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const renderInline = (node: any): string => {
       const t = String(node?.type ?? "");
 
-      if (t === "text") {
+      if (t === "text" || t === "entity-link") {
         const text = esc(String(node?.text ?? "").replace(/\u200B/g, ""));
         const bold = hasFormat(node, 1, "bold");
         const italic = hasFormat(node, 2, "italic");
@@ -2586,6 +2640,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       name: String(raw?.name ?? "Sample Story"),
       documents: Array.isArray(raw?.documents) ? raw.documents : [],
       collections: Array.isArray(raw?.collections) ? raw.collections : [],
+      datasets: Array.isArray(raw?.datasets) ? raw.datasets : [],
+      // Legacy fields kept temporarily for migration; stripped before return.
       dialogueEntries: Array.isArray(raw?.dialogueEntries) ? raw.dialogueEntries : [],
       dialogueFieldDefs,
 
@@ -2685,35 +2741,66 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       });
     }
 
-    // Normalize dialogue entries: legacy {stage, interaction} -> {fields}
-    p.dialogueEntries = (p.dialogueEntries ?? []).map((e: any) => {
-      const legacyStage = Number(e?.stage ?? 1);
-      const legacyInteraction = Number(e?.interaction ?? 1);
+    // ── Datasets migration ──────────────────────────────────────────────────
+    // Normalize each dataset's fieldDefs + entries, and (for old saves with no
+    // `datasets`) build the default Dialogue dataset from legacy dialogueEntries.
+    const coerceFieldDefs = (defs: any): DialogueFieldDef[] =>
+      (Array.isArray(defs) ? defs : [])
+        .map((d: any) => ({
+          id: String(d?.id ?? "").trim(),
+          label: String(d?.label ?? "Field").trim() || "Field",
+          type: (d?.type === "string" || d?.type === "bool" ? d.type : "number") as DatasetFieldType,
+          defaultValue: d?.defaultValue,
+        }))
+        .filter((d: DialogueFieldDef) => !!d.id);
 
-      const incomingFields =
-        e?.fields && typeof e.fields === "object"
-          ? e.fields
-          : { stage: Math.max(1, legacyStage || 1), interaction: Math.max(1, legacyInteraction || 1) };
+    const coerceResult = (raw: any, fallbackText: string): DatasetResult => {
+      const r = raw && typeof raw === "object" ? raw : null;
+      if (r?.kind === "value") {
+        const vt: DatasetFieldType = r.valueType === "number" || r.valueType === "bool" ? r.valueType : "string";
+        return { kind: "value", valueType: vt, value: vt === "number" ? Number(r.value) || 0 : String(r.value ?? "") };
+      }
+      if (r?.kind === "column" && r.collectionId && r.entityId && r.fieldId) {
+        return { kind: "column", collectionId: String(r.collectionId), entityId: String(r.entityId), fieldId: String(r.fieldId), value: r.value ?? "" };
+      }
+      return { kind: "text", value: r?.kind === "text" ? String(r.value ?? "") : fallbackText };
+    };
 
-      const fields = ensureDialogueFieldValues(dialogueFieldDefs, incomingFields);
-
-      const speakerCollectionId = String(e?.speakerCollectionId ?? e?.collectionId ?? "");
-      const speakerEntityId = String(e?.speakerEntityId ?? e?.entityId ?? e?.characterId ?? "");
-      return {
-        id: String(e?.id ?? `dlg_${Date.now()}_${Math.random().toString(16).slice(2)}`),
-        linkId: typeof e?.linkId === "string" ? e.linkId : undefined,
-
-        speakerCollectionId,
-        speakerEntityId,
-
-        // legacy alias
-        characterId: speakerEntityId,
-
-        documentId: String(e?.documentId ?? ""),
-        fields,
-        text: String(e?.text ?? ""),
-      } as any;
+    const coerceEntry = (e: any, defs: DialogueFieldDef[]): DatasetEntry => ({
+      id: String(e?.id ?? newDatasetEntryId()),
+      subjectCollectionId: String(e?.subjectCollectionId ?? e?.speakerCollectionId ?? e?.collectionId ?? "") || undefined,
+      subjectEntityId: String(e?.subjectEntityId ?? e?.speakerEntityId ?? e?.entityId ?? e?.characterId ?? "") || undefined,
+      fields: ensureDialogueFieldValues(defs, e?.fields),
+      result: coerceResult(e?.result, String(e?.text ?? "")),
     });
+
+    if (Array.isArray(p.datasets) && p.datasets.length > 0) {
+      p.datasets = p.datasets.map((ds: any) => {
+        const defs = coerceFieldDefs(ds?.fieldDefs);
+        return {
+          id: String(ds?.id ?? newDatasetId()),
+          name: String(ds?.name ?? "Dataset").trim() || "Dataset",
+          fieldDefs: defs,
+          entries: (Array.isArray(ds?.entries) ? ds.entries : []).map((e: any) => coerceEntry(e, defs)),
+        };
+      });
+    } else {
+      // Legacy save (or empty): construct the Dialogue dataset from dialogueEntries.
+      const legacyEntries = (p.dialogueEntries ?? []).map((e: any) => {
+        const incomingFields =
+          e?.fields && typeof e.fields === "object"
+            ? e.fields
+            : { stage: Math.max(1, Number(e?.stage ?? 1) || 1), interaction: Math.max(1, Number(e?.interaction ?? 1) || 1) };
+        return coerceEntry({ ...e, fields: incomingFields }, dialogueFieldDefs);
+      });
+      p.datasets = [
+        { id: DIALOGUE_DATASET_ID, name: "Dialogue", fieldDefs: dialogueFieldDefs, entries: legacyEntries },
+      ];
+    }
+
+    // Legacy fields are now fully migrated into `datasets`; drop them.
+    delete (p as any).dialogueEntries;
+    delete (p as any).dialogueFieldDefs;
 
     const docIdSet = new Set(p.documents.map((d) => d.id));
     p.documents = p.documents.map((d: any) => {
@@ -2778,28 +2865,26 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       return clean;
     });
 
-    // Optional: migrate older dialogueEntries without linkId
-    const usedDialogue = new Set<string>();
-    for (const doc of p.documents) {
-      for (const link of doc.entityLinks) {
-        const matchIndex = p.dialogueEntries.findIndex((e: any) => {
-          if (usedDialogue.has(String(e?.id))) return false;
-          if (String(e?.documentId) !== doc.id) return false;
-          const eSpeakerEntityId = String(e?.speakerEntityId ?? e?.entityId ?? e?.characterId ?? "");
-          const eSpeakerCollectionId = String(e?.speakerCollectionId ?? e?.collectionId ?? "");
-
-          if (eSpeakerCollectionId && eSpeakerCollectionId !== link.collectionId) return false;
-          if (eSpeakerEntityId !== link.entityId) return false;
-          const slice = stripDialogueQuotes(doc.content.slice(link.start, link.end));
-          return String(e?.text ?? "") === slice;
-        });
-
-        if (matchIndex !== -1) {
-          const e = p.dialogueEntries[matchIndex];
-          p.dialogueEntries[matchIndex] = { ...e, linkId: link.id };
-          usedDialogue.add(String(e.id));
+    // ✅ Migrate legacy offset-based links into EntityLink chips inside richContent.
+    // (Docs that already use chips are left alone.) This converges imports, sync, and
+    // old saves onto the chip model so renames can keep linked text current.
+    {
+      const labelOf: LabelResolver = (cid, eid) => {
+        const col = p.collections.find((c) => c.id === cid);
+        const row = col?.rows.find((r) => r.id === eid);
+        return row ? String(row.values["name"] || row.values["id"] || row.id) : null;
+      };
+      const colorOf = (cid: string) => p.collections.find((c) => c.id === cid)?.color;
+      p.documents = p.documents.map((d) => {
+        if (richContentHasChips(d.richContent)) return d;
+        if (!d.entityLinks || d.entityLinks.length === 0) return d;
+        try {
+          const res = migrateDocToChips(d, labelOf, colorOf);
+          return { ...d, richContent: res.richContent, content: res.content, entityLinks: res.entityLinks };
+        } catch {
+          return d;
         }
-      }
+      });
     }
 
     // ✅ normalize timeline labels (entity-based)
@@ -3050,7 +3135,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           cancelText: "Not now",
         })
         .then((ok) => {
-          if (ok) window.open("https://app.rpgstorytoolkit.com/?upgrade=1", "_blank", "noopener");
+          if (ok) platform.openExternal("https://app.rpgstorytoolkit.com/?upgrade=1");
         });
       return false;
     }
@@ -3059,14 +3144,25 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
   // Record a successful sync using the web row's authoritative updated_at, so the
   // staleness check below compares like-for-like (no client/server clock skew).
-  const stampSynced = async (webProjectId: string, accountId: string, syncedProject: Project | null | undefined, vault?: string) => {
-    let ts = new Date().toISOString();
-    try {
-      const { data } = await supabase.from("projects").select("updated_at").eq("id", webProjectId).maybeSingle();
-      if (data?.updated_at) ts = data.updated_at as string;
-    } catch { /* ignore */ }
-    const syncedHash = syncedProject ? hashString(JSON.stringify(syncedProject)) : undefined;
-    const meta = { webProjectId, accountId, lastSyncedAt: ts, syncedHash };
+  const stampSynced = async (
+    webProjectId: string,
+    accountId: string,
+    syncedProject: Project | null | undefined,
+    vault?: string,
+    assetPaths?: string[],
+    serverUpdatedAt?: string | null
+  ) => {
+    // Prefer the authoritative updated_at returned by the write; only fetch if absent.
+    let ts = serverUpdatedAt ?? "";
+    if (!ts) {
+      ts = new Date().toISOString();
+      try {
+        const { data } = await supabase.from("projects").select("updated_at").eq("id", webProjectId).maybeSingle();
+        if (data?.updated_at) ts = data.updated_at as string;
+      } catch { /* ignore */ }
+    }
+    const syncedHash = syncedProject ? hashString(syncContentString(syncedProject)) : undefined;
+    const meta = { webProjectId, accountId, lastSyncedAt: ts, syncedHash, syncedAssetPaths: assetPaths };
     await setVaultSyncMeta(meta, vault);
     setSyncMeta(meta);
     setWebHasNewer(false);
@@ -3137,7 +3233,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       }
       await rekeyAndUploadAssets(proj, bytes);
       await platform.saveProject(vault, proj);
-      await stampSynced(projectId, uid, proj, vault);
+      await stampSynced(projectId, uid, proj, vault, webAssetPathsFor(proj, uid));
 
       setProjectRowId(vault);
       updateRecentVaultName(vault, proj.name);
@@ -3166,11 +3262,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     await resizeForLauncher(false);
     try {
       const seed = createSeedProject("Untitled Story");
-      const vault = (await renameVaultFolder(seed.name)) ?? picked;
-      await platform.saveProject(vault, seed);
-      const created = await webPlatform.createProject(uid, seed);
       const norm = normalizeLoadedProject(seed);
-      await stampSynced(created.rowId, uid, norm, vault);
+      const vault = (await renameVaultFolder(norm.name)) ?? picked;
+      await platform.saveProject(vault, norm);
+      const created = await webPlatform.createProject(uid, norm);
+      await stampSynced(created.rowId, uid, norm, vault, webAssetPathsFor(norm, uid));
 
       setProjectRowId(vault);
       updateRecentVaultName(vault, seed.name);
@@ -3203,17 +3299,22 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   };
 
   // Re-key a project's assets into the WEB storage scheme (mutates `proj`, which
-  // must be a clone). Returns the uploads to perform: read each `oldPath` from
-  // the vault, upload its bytes to `newPath` on the web.
-  const rekeyForWeb = (proj: Project, accountId: string) => {
+  // must be a clone). Returns the uploads to perform plus `allWebPaths` (every
+  // asset's web path). When `alreadySynced` is given, assets already on the web are
+  // re-keyed (so the saved JSON points at them) but skipped from the upload list.
+  const rekeyForWeb = (proj: Project, accountId: string, alreadySynced?: Set<string>) => {
     const pathMap = new Map<string, string>();
     const uploads: { oldPath: string; newPath: string; name: string; mime: string }[] = [];
+    const allWebPaths = new Set<string>();
     const rekey = (oldPath: string, newPath: string, name: string, mime: string): string => {
       if (!oldPath) return oldPath;
       const ex = pathMap.get(oldPath);
       if (ex) return ex;
       pathMap.set(oldPath, newPath);
-      uploads.push({ oldPath, newPath, name, mime });
+      allWebPaths.add(newPath);
+      if (!alreadySynced || !alreadySynced.has(newPath)) {
+        uploads.push({ oldPath, newPath, name, mime });
+      }
       return newPath;
     };
     for (const col of proj.collections ?? []) {
@@ -3244,23 +3345,59 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     };
     for (const m of proj.worldMaps ?? []) m.imagePath = remap(m.imagePath);
     if (proj.view) proj.view.worldMapImagePath = remap(proj.view.worldMapImagePath);
-    return uploads;
+    return { uploads, allWebPaths: [...allWebPaths] };
   };
 
-  // Push the current local project (+ assets) up to its linked web project.
-  // Returns the local project that is now the synced baseline.
-  const syncPushToWeb = async (webProjectId: string, accountId: string): Promise<Project> => {
+  // Every web asset path for a project (no upload) — used to record the synced asset
+  // set after a pull, so a subsequent push knows those bytes are already on the web.
+  const webAssetPathsFor = (proj: Project, accountId: string): string[] =>
+    rekeyForWeb(structuredClone(proj), accountId).allWebPaths;
+
+  // Push the current local project (+ assets) up to its linked web project. Only
+  // assets not already on the web are uploaded. Returns the synced baseline project
+  // and the full set of web asset paths (to stamp into sync.json).
+  // Raised when a safe (non-forced) push finds the web copy changed since our baseline.
+  const WEB_CONFLICT = "WEB_CONFLICT";
+
+  const syncPushToWeb = async (
+    webProjectId: string,
+    accountId: string,
+    opts?: { incremental?: boolean; force?: boolean }
+  ): Promise<{ project: Project; assetPaths: string[]; updatedAt: string | null }> => {
     const live = (projectRef.current ?? project) as Project;
     const clone = structuredClone(live) as Project;
-    const uploads = rekeyForWeb(clone, accountId);
+    const meta = await getVaultSyncMeta(getVaultPath() ?? undefined);
+
+    // Safe pushes use optimistic concurrency against our last-synced timestamp; forced
+    // pushes (explicit "Sync now → Push") overwrite unconditionally.
+    const expected = opts?.force ? null : meta?.lastSyncedAt ?? null;
+
+    // Manual/forced pushes re-upload everything (authoritative); auto-sync only new assets.
+    const already = opts?.incremental ? new Set(meta?.syncedAssetPaths ?? []) : new Set<string>();
+    const { uploads, allWebPaths } = rekeyForWeb(clone, accountId, already);
+
+    // Upload new assets first. Track which actually landed so a failed upload is never
+    // recorded as synced (it'll retry next time). A thrown upload aborts the whole push
+    // so the web row never points at missing bytes.
+    const uploadedNew = new Set<string>();
     for (const u of uploads) {
       const data = await platform.readAssetBytes(u.oldPath).catch(() => null);
-      if (!data) continue;
+      if (!data) continue; // can't read locally — skip, do NOT mark as synced
       const file = new File([data as unknown as BlobPart], u.name, { type: u.mime });
       await webPlatform.uploadAsset(file, u.newPath);
+      uploadedNew.add(u.newPath);
     }
-    await webPlatform.saveProject(webProjectId, clone);
-    return live;
+
+    const result = await webPlatform.saveProjectIfUnchanged!(webProjectId, clone, expected);
+    if (!result.ok) {
+      setWebHasNewer(true);
+      throw new Error(WEB_CONFLICT);
+    }
+
+    // Synced asset set = previously-synced (still present) + newly uploaded; never the
+    // ones we couldn't read.
+    const syncedAssets = allWebPaths.filter((p) => already.has(p) || uploadedNew.has(p));
+    return { project: live, assetPaths: syncedAssets, updatedAt: result.updatedAt };
   };
 
   // Pull the linked web project (+ assets) down, overwriting the local vault.
@@ -3328,13 +3465,19 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setLoadingInit(true);
     try {
       let syncedProj: Project;
+      let assetPaths: string[];
+      let serverTs: string | null = null;
       if (choice === "push") {
         if (isDirty) await saveProjectToSupabase();
-        syncedProj = await syncPushToWeb(syncMeta.webProjectId, syncMeta.accountId);
+        const res = await syncPushToWeb(syncMeta.webProjectId, syncMeta.accountId, { force: true });
+        syncedProj = res.project;
+        assetPaths = res.assetPaths;
+        serverTs = res.updatedAt;
       } else {
         syncedProj = await syncPullFromWeb(syncMeta.webProjectId, syncMeta.accountId);
+        assetPaths = webAssetPathsFor(syncedProj, syncMeta.accountId);
       }
-      await stampSynced(syncMeta.webProjectId, syncMeta.accountId, syncedProj);
+      await stampSynced(syncMeta.webProjectId, syncMeta.accountId, syncedProj, undefined, assetPaths, serverTs);
       await appModal.alert(choice === "push" ? "Pushed to your web account." : "Pulled from your web account.", { title: "Synced" });
     } catch (e: any) {
       appModal.alert(e?.message ?? "Sync failed.", { title: "Sync" });
@@ -3366,7 +3509,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       const created = await webPlatform.createProject(uid, structuredClone(live) as Project);
       const clone = structuredClone(live) as Project;
       clone.id = created.project.id ?? clone.id;
-      const uploads = rekeyForWeb(clone, uid);
+      const { uploads, allWebPaths } = rekeyForWeb(clone, uid);
       for (const u of uploads) {
         const data = await platform.readAssetBytes(u.oldPath).catch(() => null);
         if (!data) continue;
@@ -3374,7 +3517,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         await webPlatform.uploadAsset(file, u.newPath);
       }
       await webPlatform.saveProject(created.rowId, clone);
-      await stampSynced(created.rowId, uid, live);
+      await stampSynced(created.rowId, uid, live, undefined, allWebPaths);
       await appModal.alert("This project is now synced to your web account.", { title: "Synced" });
     } catch (e: any) {
       appModal.alert(e?.message ?? "Failed to sync this project.", { title: "Sync" });
@@ -3382,6 +3525,98 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       setLoadingInit(false);
     }
   };
+
+  // ── Auto-sync on save (desktop, Pro) ────────────────────────────────────────
+  // Snapshot the values runAutoSync needs so the debounced callback reads them fresh.
+  const autoSyncStateRef = useRef<{
+    enabled: boolean;
+    meta: typeof syncMeta;
+    pro: boolean;
+    webNewer: boolean;
+    offline: boolean;
+    accountId: string;
+  }>({ enabled: false, meta: null, pro: false, webNewer: false, offline: false, accountId: "" });
+  useEffect(() => {
+    autoSyncStateRef.current = {
+      enabled: autoSyncOnSave,
+      meta: syncMeta,
+      pro: syncIsPro,
+      webNewer: webHasNewer,
+      offline: isOffline,
+      accountId: syncSession?.user.id ?? "",
+    };
+  });
+
+  const runAutoSync = async () => {
+    const s = autoSyncStateRef.current;
+    if (!isDesktop || !s.enabled || !s.pro || !s.meta || s.offline) return;
+    if (s.meta.accountId !== s.accountId) return; // signed into a different account
+    if (s.webNewer) return; // web is ahead — don't auto-overwrite; user resolves via Sync now
+    const live = projectRef.current;
+    if (!live) return;
+    const unpushed = !!s.meta.syncedHash && hashString(syncContentString(live)) !== s.meta.syncedHash;
+    if (!unpushed) return;
+    if (savingRef.current || autoSyncingRef.current) {
+      scheduleAutoSync(); // a save/sync is in flight; try again shortly
+      return;
+    }
+    autoSyncingRef.current = true;
+    try {
+      const res = await syncPushToWeb(s.meta.webProjectId, s.meta.accountId, { incremental: true });
+      await stampSynced(s.meta.webProjectId, s.meta.accountId, res.project, undefined, res.assetPaths, res.updatedAt);
+    } catch (e: any) {
+      // WEB_CONFLICT: the web changed since our baseline — leave it for the user to
+      // resolve (the chip already flips to "newer on web" / "both changed"). Any other
+      // failure is silent and retried after the next save.
+      if (e?.message !== WEB_CONFLICT) checkWebNewer();
+    } finally {
+      autoSyncingRef.current = false;
+    }
+  };
+
+  const scheduleAutoSync = () => {
+    if (!autoSyncStateRef.current.enabled) return;
+    if (autoSyncTimerRef.current != null) window.clearTimeout(autoSyncTimerRef.current);
+    autoSyncTimerRef.current = window.setTimeout(() => {
+      autoSyncTimerRef.current = null;
+      void runAutoSync();
+    }, AUTO_SYNC_DELAY_MS);
+  };
+
+  // Auto-pull: when the web copy is newer AND we have nothing local to lose, bring it
+  // down automatically so devices converge. Never pulls with unsaved/unpushed local
+  // edits (that's a "Both changed" conflict the user resolves via Sync now).
+  const doAutoPull = async () => {
+    const s = autoSyncStateRef.current;
+    if (!isDesktop || !s.enabled || !s.pro || !s.meta || s.offline) return;
+    if (s.meta.accountId !== s.accountId) return;
+    if (dirtyRef.current || savingRef.current || autoSyncingRef.current) return;
+    const live = projectRef.current;
+    const unpushed = !!s.meta?.syncedHash && !!live && hashString(syncContentString(live)) !== s.meta.syncedHash;
+    if (unpushed) return; // both sides changed → leave for manual resolution
+    autoSyncingRef.current = true;
+    try {
+      const proj = await syncPullFromWeb(s.meta.webProjectId, s.meta.accountId);
+      await stampSynced(s.meta.webProjectId, s.meta.accountId, proj, undefined, webAssetPathsFor(proj, s.meta.accountId));
+    } catch {
+      /* silent — chip stays "newer on web" for manual pull */
+    } finally {
+      autoSyncingRef.current = false;
+    }
+  };
+
+  useEffect(() => {
+    if (webHasNewer) void doAutoPull();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webHasNewer]);
+
+  // Reconnecting: re-check the web (may auto-pull) and flush any unpushed local edits.
+  useEffect(() => {
+    const onOnline = () => { checkWebNewer(); scheduleAutoSync(); };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [checkWebNewer]);
 
   // Desktop: switch to another local project (recent vault), guarding unsaved work.
   const switchToVault = async (path: string) => {
@@ -3408,10 +3643,23 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   // Load sync badges for recent vaults when the desktop switcher opens.
   const refreshVaultSyncStatus = async () => {
     const recents = getRecentVaults();
-    const entries = await Promise.all(
-      recents.map(async (v) => [v.path, !!(await getVaultSyncMeta(v.path))] as const)
+    const metas = await Promise.all(
+      recents.map(async (v) => [v.path, await getVaultSyncMeta(v.path)] as const)
     );
-    setVaultSyncStatus(Object.fromEntries(entries));
+    const status: Record<string, boolean> = {};
+    const linked = new Set<string>();
+    for (const [path, meta] of metas) {
+      status[path] = !!meta;
+      if (meta?.webProjectId) linked.add(meta.webProjectId);
+    }
+    setVaultSyncStatus(status);
+    setLinkedWebIds(linked);
+    // Refresh the web-account project list so the switcher can offer them too.
+    if (syncSession) {
+      webPlatform.listProjects(syncSession.user.id).then(setLauncherWebProjects).catch(() => {});
+    } else {
+      setLauncherWebProjects([]);
+    }
   };
 
   // When the launcher is open, load recent vaults and verify each still exists.
@@ -3949,6 +4197,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
       setSaveMessage("Saved.");
       setTimeout(() => setSaveMessage(null), 2000);
+
+      // Desktop Pro: quietly push to the linked web project shortly after saving.
+      if (isDesktop) scheduleAutoSync();
     } catch (e: any) {
       setSaveMessage(`Save failed: ${e?.message ?? "Unknown error"}`);
     } finally {
@@ -4919,8 +5170,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setProject((prev) => {
       if (!prev) return prev;
       const docs = prev.documents.filter((d) => d.id !== id);
-      const dialogueEntries = prev.dialogueEntries.filter((e) => e.documentId !== id);
-      return { ...prev, documents: docs, dialogueEntries };
+      return { ...prev, documents: docs };
     });
 
     if (activeDocId === id) {
@@ -5076,11 +5326,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         entityLinks: d.entityLinks.filter((l) => l.collectionId !== id),
       }));
 
-      // Remove dialogue entries whose link got deleted
-      const remainingLinkIds = new Set(documents.flatMap((d) => d.entityLinks.map((l) => l.id)));
-      const dialogueEntries = prev.dialogueEntries.filter((e) => !e.linkId || remainingLinkIds.has(e.linkId));
+      // Scrub dataset references to the deleted collection.
+      const datasets = scrubDatasetRefs(prev.datasets, { collectionId: id });
 
-      return { ...prev, collections, documents, dialogueEntries };
+      return { ...prev, collections, documents, datasets };
     });
 
     if (activeCollectionId === id) {
@@ -5231,7 +5480,6 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         return {
           ...prev,
           documents: prev.documents.filter((d) => !removedIds.has(d.id)),
-          dialogueEntries: prev.dialogueEntries.filter((e) => !removedIds.has(e.documentId)),
           documentFolders: (prev.documentFolders ?? []).filter((f) => !pathStartsWith(f, path)),
         };
       });
@@ -5255,12 +5503,13 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           ...d,
           entityLinks: d.entityLinks.filter((l) => !removedIds.has(l.collectionId)),
         }));
-        const remainingLinkIds = new Set(documents.flatMap((d) => d.entityLinks.map((l) => l.id)));
+        let datasets = prev.datasets;
+        for (const cid of removedIds) datasets = scrubDatasetRefs(datasets, { collectionId: cid });
         return {
           ...prev,
           collections: prev.collections.filter((c) => !removedIds.has(c.id)),
           documents,
-          dialogueEntries: prev.dialogueEntries.filter((e) => !e.linkId || remainingLinkIds.has(e.linkId)),
+          datasets,
           collectionFolders: (prev.collectionFolders ?? []).filter((f) => !pathStartsWith(f, path)),
         };
       });
@@ -5445,9 +5694,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setProject((prev) => {
       if (!prev) return prev;
 
-      return {
-        ...prev,
-        collections: prev.collections.map((c) => {
+      const collections = prev.collections.map((c) => {
           if (c.id !== collectionId) return c;
 
           const fieldType = c.schema.find((f) => f.id === fieldId)?.type ?? "string";
@@ -5501,8 +5748,30 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               return updated;
             }),
           };
-        }),
-      };
+      });
+
+      // When a record's label (name, or id fallback) changes, re-sync every `label`
+      // chip that points at it across ALL documents (open or not). Unlinked text and
+      // `text`-mode chips are untouched.
+      let documents = prev.documents;
+      if (fieldId === "name" || fieldId === "id") {
+        const labelOf: LabelResolver = (cid, eid) => {
+          const col = collections.find((c) => c.id === cid);
+          const row = col?.rows.find((r) => r.id === eid);
+          return row ? String(row.values["name"] || row.values["id"] || row.id) : null;
+        };
+        const colorOf = (cid: string) => collections.find((c) => c.id === cid)?.color;
+        documents = prev.documents.map((d) => {
+          try {
+            const res = reconcileDocChips(d, labelOf, colorOf);
+            return res ? { ...d, richContent: res.richContent, content: res.content, entityLinks: res.entityLinks } : d;
+          } catch {
+            return d;
+          }
+        });
+      }
+
+      return { ...prev, collections, documents };
     });
 
     // Trigger immediate folder rename on desktop
@@ -5553,17 +5822,19 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       confirmText: "Add column",
       cancelText: "Cancel",
       options: [
-        { value: "string", label: "String — short text" },
-        { value: "number", label: "Number — numeric value" },
-        { value: "text", label: "Text — long notes" },
+        { value: "string", label: "String (short text)" },
+        { value: "number", label: "Number (numeric value)" },
+        { value: "bool", label: "Bool (true / false)" },
+        { value: "text", label: "Text (long notes)" },
       ],
     });
     if (!typeInput) return;
 
     const fieldType: CollectionField["type"] =
-      typeInput === "number" ? "number" : typeInput === "text" ? "text" : "string";
+      typeInput === "number" ? "number" : typeInput === "bool" ? "bool" : typeInput === "text" ? "text" : "string";
 
     const newField: CollectionField = { id: normalizedId, label: trimmedLabel, type: fieldType };
+    const defaultValue: string | number = fieldType === "number" ? 0 : fieldType === "bool" ? "false" : "";
 
     setProject((prev) => {
       if (!prev) return prev;
@@ -5576,7 +5847,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             schema: [...c.schema, newField],
             rows: c.rows.map((r) => ({
               ...r,
-              values: { ...r.values, [normalizedId]: fieldType === "number" ? 0 : "" },
+              values: { ...r.values, [normalizedId]: defaultValue },
             })),
           };
         }),
@@ -5717,14 +5988,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         entityLinks: d.entityLinks.filter((l) => !(l.collectionId === collectionId && l.entityId === rowId)),
       }));
 
-      const remainingLinkIds = new Set(documents.flatMap((d) => d.entityLinks.map((l) => l.id)));
-      const dialogueEntries = prev.dialogueEntries.filter((e) => {
-        if (e.linkId && !remainingLinkIds.has(e.linkId)) return false;
-        if (collectionId === charactersCollection?.id && e.characterId === rowId) return false;
-        return true;
-      });
+      const datasets = scrubDatasetRefs(prev.datasets, { collectionId, rowId });
 
-      return { ...prev, collections, documents, dialogueEntries };
+      return { ...prev, collections, documents, datasets };
     });
 
     if (isDesktop && rowCol && rowKey) {
@@ -6527,39 +6793,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           adjustedLinks.push({ ...link, start: s, end: e });
         }
 
-        const linkById = new Map(adjustedLinks.map((l) => [l.id, l]));
-        const updatedDialogueEntries = prev.dialogueEntries
-          .filter((e) => e.documentId !== docId)
-          .concat(
-            prev.dialogueEntries
-              .filter((e) => e.documentId === docId)
-              .filter((e) => !e.linkId || linkById.has(e.linkId))
-              .map((e) => {
-                if (!e.linkId) return e;
-                const lnk = linkById.get(e.linkId);
-                if (!lnk) return e;
-                const raw = normalizedNewContent.slice(lnk.start, lnk.end);
-                return { ...e, text: stripDialogueQuotes(raw) };
-              })
-          );
-
-        (doc as any).__updatedDialogueEntries = updatedDialogueEntries;
-
         return { ...doc, content: normalizedNewContent, entityLinks: adjustedLinks };
       });
 
-      const patched = documents.find((d: any) => (d as any).__updatedDialogueEntries);
-      const nextDialogueEntries: DialogueEntry[] =
-        patched && (patched as any).__updatedDialogueEntries
-          ? ((patched as any).__updatedDialogueEntries as DialogueEntry[])
-          : prev.dialogueEntries;
-
-      const cleanedDocs = documents.map((d: any) => {
-        const { __updatedDialogueEntries: _x, ...rest } = d;
-        return rest as Doc;
-      });
-
-      return { ...prev, documents: cleanedDocs, dialogueEntries: nextDialogueEntries };
+      return { ...prev, documents };
     });
   };
 
@@ -6602,40 +6839,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           }
         }
 
-        // Keep dialogue entries in sync for this doc (same behavior as updateDocumentContent)
-        const linkById = new Map(adjustedLinks.map((l) => [l.id, l]));
-        const updatedDialogueEntries = prev.dialogueEntries
-          .filter((e) => e.documentId !== docId)
-          .concat(
-            prev.dialogueEntries
-              .filter((e) => e.documentId === docId)
-              .filter((e) => !e.linkId || linkById.has(e.linkId))
-              .map((e) => {
-                if (!e.linkId) return e;
-                const lnk = linkById.get(e.linkId);
-                if (!lnk) return e;
-                const raw = newText.slice(lnk.start, lnk.end);
-                return { ...e, text: stripDialogueQuotes(raw) };
-              })
-          );
-
-        (nextDoc as any).__updatedDialogueEntries = updatedDialogueEntries;
-
         // Store updated plain text + remapped links
         nextDoc = { ...nextDoc, content: newText, entityLinks: adjustedLinks };
         return nextDoc;
       });
 
-      // Preserve your existing __updatedDialogueEntries plumbing (same as updateDocumentContent cleanup)
-      const nextDialogueEntries =
-        (documents.find((d: any) => d.id === docId) as any)?.__updatedDialogueEntries ?? prev.dialogueEntries;
-
-      const cleanedDocs = documents.map((d: any) => {
-        const { __updatedDialogueEntries: _x, ...rest } = d;
-        return rest as Doc;
-      });
-
-      return { ...prev, documents: cleanedDocs, dialogueEntries: nextDialogueEntries };
+      return { ...prev, documents };
     });
   };
 
@@ -6681,16 +6890,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         height: anchorRect.height,
       });
 
-      const dlg = project.dialogueEntries.find((d) => d.linkId === link.id);
-      if (dlg) {
-        setLinkingIsDialogue(true);
-        setLinkingDialogueFields(ensureDialogueFieldValues(dialogueFieldDefs, (dlg as any).fields));
-      } else {
-        setLinkingIsDialogue(false);
-        setLinkingDialogueFields(buildDefaultDialogueFieldValues(dialogueFieldDefs));
-      }
     },
-    [project, activeDoc, dialogueFieldDefs, layoutMode, focusView]
+    [project, activeDoc, layoutMode, focusView]
   );
 
   // Keeps the link popover from disappearing when you click its controls (which can collapse editor selection).
@@ -6701,79 +6902,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setEditingLinkId(null);
     setLinkingCollectionId("");
     setLinkingEntityId("");
-    setLinkingIsDialogue(false);
-    setLinkingDialogueFields(buildDefaultDialogueFieldValues(dialogueFieldDefs));
     setLinkingNotice(null);
 
     setCaretLinkId(null);
     setLinkPopoverAnchorRect(null);
-  }, [dialogueFieldDefs]);
-
-  // Shared dialogue-field inputs, used by both the create-link and edit-link popover modes.
-  const renderDialogueFieldInputs = () =>
-    dialogueFieldDefs.map((def) => {
-      const raw = linkingDialogueFields[def.id];
-      const numVal = Math.max(1, Number(raw) || 1);
-      const strVal = raw === undefined || raw === null ? "" : String(raw);
-
-      return (
-        <label key={def.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, opacity: 0.9 }}>
-          {def.label}
-          {def.type === "number" ? (
-            <input
-              type="number"
-              min={1}
-              value={Number.isFinite(numVal) ? numVal : 1}
-              onChange={(e) =>
-                setLinkingDialogueFields((prev) => ({
-                  ...prev,
-                  [def.id]: Math.max(1, Number(e.target.value) || 1),
-                }))
-              }
-              style={{
-                width: 64,
-                borderRadius: 8,
-                border: "1px solid var(--border-2)",
-                background: "var(--bg-surface)",
-                color: "var(--text)",
-                padding: "6px 8px",
-              }}
-            />
-          ) : def.type === "bool" ? (
-            <input
-              type="checkbox"
-              checked={raw === "true"}
-              onChange={(e) =>
-                setLinkingDialogueFields((prev) => ({
-                  ...prev,
-                  [def.id]: e.target.checked ? "true" : "false",
-                }))
-              }
-              style={{ width: 16, height: 16 }}
-            />
-          ) : (
-            <input
-              type="text"
-              value={strVal}
-              onChange={(e) =>
-                setLinkingDialogueFields((prev) => ({
-                  ...prev,
-                  [def.id]: e.target.value,
-                }))
-              }
-              style={{
-                width: 110,
-                borderRadius: 8,
-                border: "1px solid var(--border-2)",
-                background: "var(--bg-surface)",
-                color: "var(--text)",
-                padding: "6px 8px",
-              }}
-            />
-          )}
-        </label>
-      );
-    });
+  }, []);
 
   // Close link popover on Escape or clicking off the highlighted selection (and outside the popover)
   useEffect(() => {
@@ -6869,8 +7002,6 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setEditingLinkId(null);
     setLinkingCollectionId("");
     setLinkingEntityId("");
-    setLinkingIsDialogue(false);
-    setLinkingDialogueFields(buildDefaultDialogueFieldValues(dialogueFieldDefs));
     setLinkingNotice(null);
   };
 
@@ -6902,28 +7033,30 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       setLinkingEntityId(link.entityId);
       setEditingLinkId(link.id);
       setLinkingNotice(null);
-
-      const dlg = project.dialogueEntries.find((d) => d.linkId === link.id);
-      if (dlg) {
-        setLinkingIsDialogue(true);
-        setLinkingDialogueFields(ensureDialogueFieldValues(dialogueFieldDefs, (dlg as any).fields));
-      } else {
-        setLinkingIsDialogue(false);
-        setLinkingDialogueFields(buildDefaultDialogueFieldValues(dialogueFieldDefs));
-      }
     },
-    [project, activeDoc, dialogueFieldDefs, linkingSelection, editingLinkId]
+    [project, activeDoc, linkingSelection, editingLinkId]
   );
 
-  const createNewLink = (docId: Id, collectionId: Id, entityId: Id, start: number, end: number): EntityLink => ({
-    id: `link_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-    docId,
-    collectionId,
-    entityId,
-    start,
-    end,
-  });
+  // Replace a document's derived link index (chips report their offsets up here).
+  const updateDocumentLinks = (docId: Id, links: EntityLink[]) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      let changed = false;
+      const documents = prev.documents.map((d) => {
+        if (d.id !== docId) return d;
+        const norm = links.map((l) => ({ ...l, docId }));
+        if (JSON.stringify(norm) === JSON.stringify(d.entityLinks)) return d;
+        changed = true;
+        return { ...d, entityLinks: norm };
+      });
+      return changed ? { ...prev, documents } : prev;
+    });
+  };
 
+  const newLinkId = () => `link_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+  // Slash-link: the typeahead already inserted the record's label as plain text at
+  // [start,end]; wrap that span into a label chip. Links sync up via onLinksChange.
   const handleSlashLinkCreate = (payload: {
     newText: string;
     start: number;
@@ -6932,257 +7065,35 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     entityId: Id;
   }) => {
     if (!project || !activeDoc) return;
-
-    // 1) Update document content (also adjusts existing links to stay aligned)
-    updateDocumentContent(activeDoc.id, payload.newText);
-
-    // 2) Add the new link (no dialogue auto-creation here)
-    setProject((prev) => {
-      if (!prev) return prev;
-
-      const doc = prev.documents.find((d) => d.id === activeDoc.id);
-      if (!doc) return prev;
-
-      const overlaps = doc.entityLinks.some(
-        (l) => !(payload.end <= l.start || payload.start >= l.end)
-      );
-      if (overlaps) return prev;
-
-      const newLink = createNewLink(
-        activeDoc.id,
-        payload.collectionId,
-        payload.entityId,
-        payload.start,
-        payload.end
-      );
-
-      const documents = prev.documents.map((d) =>
-        d.id === activeDoc.id
-          ? { ...d, entityLinks: [...d.entityLinks, newLink].sort((a, b) => a.start - b.start) }
-          : d
-      );
-
-      return { ...prev, documents };
-    });
-  };
-
-  const handleDialogueQuoteLinkCreate = (payload: {
-    start: number;
-    end: number;
-    collectionId: Id;
-    entityId: Id;
-  }) => {
-    if (!project || !activeDoc) return;
-
-    // Avoid overlapping existing links
-    const overlaps = activeDoc.entityLinks.some(
-      (l) => !(payload.end <= l.start || payload.start >= l.end)
-    );
-    if (overlaps) return;
-
-    setQuoteDialoguePending({
-      start: payload.start,
-      end: payload.end,
+    const label = labelResolver(payload.collectionId, payload.entityId) ?? payload.newText.slice(payload.start, payload.end);
+    linkApiRef.current?.wrapRange(payload.start, payload.end, label, {
+      linkId: newLinkId(),
       collectionId: payload.collectionId,
       entityId: payload.entityId,
+      linkMode: "label",
+      color: colorResolver(payload.collectionId),
     });
-
-    // Reset per-line field values to defaults each time
-    setQuoteDialogueFields(buildDefaultDialogueFieldValues(dialogueFieldDefs));
-    setQuoteDialogueModalOpen(true);
-  };
-
-  const confirmDialogueQuoteLink = () => {
-    if (!project || !activeDoc || !quoteDialoguePending) return;
-
-    const { start, end, collectionId, entityId } = quoteDialoguePending;
-
-    setProject((prev) => {
-      if (!prev) return prev;
-
-      const doc = prev.documents.find((d) => d.id === activeDoc.id);
-      if (!doc) return prev;
-
-      const overlaps = doc.entityLinks.some((l) => !(end <= l.start || start >= l.end));
-      if (overlaps) return prev;
-
-      const newLink = createNewLink(doc.id, collectionId, entityId, start, end);
-
-      const documents = prev.documents.map((d) =>
-        d.id === doc.id
-          ? { ...d, entityLinks: [...d.entityLinks, newLink].sort((a, b) => a.start - b.start) }
-          : d
-      );
-
-      // Create a dialogue entry bound to this link (text stays unchanged in the editor)
-      const raw = doc.content.slice(start, end);
-      const text = stripDialogueQuotes(raw);
-      const fields = ensureDialogueFieldValues(dialogueFieldDefs, quoteDialogueFields);
-
-      const newEntry: DialogueEntry = {
-        id: `dlg_${newLink.id}`,
-        linkId: newLink.id,
-
-        // Generic speaker reference
-        speakerCollectionId: collectionId,
-        speakerEntityId: entityId,
-
-        // Legacy alias (optional)
-        characterId: entityId,
-
-        documentId: doc.id,
-        fields,
-        text,
-      } as any;
-
-      return { ...prev, documents, dialogueEntries: [...prev.dialogueEntries, newEntry] };
-    });
-
-    setQuoteDialogueModalOpen(false);
-    setQuoteDialoguePending(null);
-  };
-
-  React.useEffect(() => {
-    if (!quoteDialogueModalOpen) return;
-
-    const prevActive = document.activeElement as HTMLElement | null;
-
-    // Force focus INTO the modal so typing never hits the editor behind.
-    requestAnimationFrame(() => {
-      if (quoteDialogueFirstFieldRef.current) {
-        quoteDialogueFirstFieldRef.current.focus();
-        quoteDialogueFirstFieldRef.current.select?.();
-        return;
-      }
-      const closeBtn = document.getElementById("quote-dialogue-close-btn") as HTMLButtonElement | null;
-      closeBtn?.focus();
-    });
-
-    const stopEvent = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      (e as any).stopImmediatePropagation?.();
-    };
-
-    const onKeyDown = (e: KeyboardEvent) => {
-      // Don’t trigger while IME is composing (JP/CN input)
-      if ((e as any).isComposing) return;
-
-      const modalEl = document.getElementById("quote-dialogue-modal");
-
-      // If modal is open and the event target is NOT inside it, swallow the key
-      // so the Lexical editor never sees it (prevents background typing/newlines).
-      if (
-        modalEl &&
-        e.target instanceof Node &&
-        !modalEl.contains(e.target) &&
-        !e.metaKey &&
-        !e.ctrlKey &&
-        !e.altKey
-      ) {
-        if (e.key === "Enter" && !e.shiftKey) {
-          stopEvent(e);
-          confirmDialogueQuoteLink();
-          return;
-        }
-
-        if (e.key === "Escape") {
-          stopEvent(e);
-          setQuoteDialogueModalOpen(false);
-          setQuoteDialoguePending(null);
-          return;
-        }
-
-        stopEvent(e);
-        return;
-      }
-
-      // Enter = quick “Link dialogue”
-      if (
-        e.key === "Enter" &&
-        !e.shiftKey &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        !e.altKey
-      ) {
-        stopEvent(e);
-        confirmDialogueQuoteLink();
-        return;
-      }
-
-      // Escape closes modal
-      if (e.key === "Escape") {
-        stopEvent(e);
-        setQuoteDialogueModalOpen(false);
-        setQuoteDialoguePending(null);
-      }
-    };
-
-    // capture=true so it runs before the editor’s handlers
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown, true);
-
-      // Restore focus back to whatever had it before the modal opened
-      requestAnimationFrame(() => {
-        prevActive?.focus?.();
-      });
-    };
-  }, [quoteDialogueModalOpen, confirmDialogueQuoteLink]);
-  const upsertDialogueForLink = (prev: Project, link: EntityLink): Project => {
-    const shouldBeDialogue = linkingIsDialogue;
-
-    if (!shouldBeDialogue) {
-      return {
-        ...prev,
-        dialogueEntries: prev.dialogueEntries.filter((d) => d.linkId !== link.id),
-      };
-    }
-
-    const doc = prev.documents.find((d) => d.id === link.docId);
-    const raw = doc ? doc.content.slice(link.start, link.end) : "";
-    const text = stripDialogueQuotes(raw);
-
-    const fields = ensureDialogueFieldValues(dialogueFieldDefs, linkingDialogueFields);
-
-    const existing = prev.dialogueEntries.find((d) => d.linkId === link.id);
-    if (existing) {
-      const updated: DialogueEntry = {
-        ...(existing as any),
-        speakerCollectionId: link.collectionId,
-        speakerEntityId: link.entityId,
-        characterId: link.entityId,
-        documentId: link.docId,
-        fields,
-        text,
-      } as any;
-
-      return {
-        ...prev,
-        dialogueEntries: prev.dialogueEntries.map((d) => (d.linkId === link.id ? updated : d)),
-      };
-    }
-
-    const newEntry: DialogueEntry = {
-      id: `dlg_${link.id}`,
-      linkId: link.id,
-      speakerCollectionId: link.collectionId,
-      speakerEntityId: link.entityId,
-      characterId: link.entityId, // legacy alias
-      documentId: link.docId,
-      fields,
-      text,
-    } as any;
-
-    return { ...prev, dialogueEntries: [...prev.dialogueEntries, newEntry] };
   };
 
   const saveLink = () => {
-    if (!project || !activeDoc || !linkingSelection || !linkingCollectionId || !linkingEntityId) return;
+    if (!project || !activeDoc || !linkingCollectionId || !linkingEntityId) return;
+    const label = labelResolver(linkingCollectionId, linkingEntityId) ?? "";
+    const color = colorResolver(linkingCollectionId);
 
-    // ✅ #2: Validate overlap at the moment of clicking Create/Update (current state),
-    // and only show the message if it truly overlaps.
-    if (!editingLinkId) {
+    if (editingLinkId) {
+      // Re-point an existing chip at the chosen record. Relabel only if it was a
+      // single-word (label-tracking) span.
+      const existing = activeDoc.entityLinks.find((l) => l.id === editingLinkId);
+      const curText = existing ? activeDoc.content.slice(existing.start, existing.end) : "";
+      linkApiRef.current?.updateLink(editingLinkId, {
+        collectionId: linkingCollectionId,
+        entityId: linkingEntityId,
+        label,
+        color,
+        relabel: isSingleWord(curText),
+      });
+    } else {
+      if (!linkingSelection) return;
       const overlapsNow = activeDoc.entityLinks.some(
         (l) => !(linkingSelection.end <= l.start || linkingSelection.start >= l.end)
       );
@@ -7190,91 +7101,32 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         setLinkingNotice("Selection overlaps an existing link. Click the highlighted text to edit/unlink it.");
         return;
       }
+      const selText = activeDoc.content.slice(linkingSelection.start, linkingSelection.end);
+      const single = isSingleWord(selText);
+      linkApiRef.current?.wrapRange(linkingSelection.start, linkingSelection.end, single ? (label || selText) : selText, {
+        linkId: newLinkId(),
+        collectionId: linkingCollectionId,
+        entityId: linkingEntityId,
+        linkMode: single ? "label" : "text",
+        color,
+      });
     }
-
-    setProject((prev) => {
-      if (!prev) return prev;
-
-      const doc = prev.documents.find((d) => d.id === activeDoc.id);
-      if (!doc) return prev;
-
-      if (editingLinkId) {
-        const updatedDocs = prev.documents.map((d) => {
-          if (d.id !== doc.id) return d;
-
-          const updatedLinks = d.entityLinks.map((l) =>
-            l.id === editingLinkId
-              ? {
-                ...l,
-                collectionId: linkingCollectionId,
-                entityId: linkingEntityId,
-                start: linkingSelection.start,
-                end: linkingSelection.end,
-              }
-              : l
-          );
-
-          return { ...d, entityLinks: updatedLinks };
-        });
-
-        const nextAfterLinkUpdate: Project = { ...prev, documents: updatedDocs };
-
-        const updatedDoc = nextAfterLinkUpdate.documents.find((d) => d.id === doc.id);
-        const updatedLink = updatedDoc?.entityLinks.find((l) => l.id === editingLinkId) ?? null;
-
-        if (!updatedLink) return nextAfterLinkUpdate;
-
-        return upsertDialogueForLink(nextAfterLinkUpdate, updatedLink);
-      }
-
-      const selectionStart = linkingSelection.start;
-      const selectionEnd = linkingSelection.end;
-
-      const overlaps = doc.entityLinks.some((l) => !(selectionEnd <= l.start || selectionStart >= l.end));
-      if (overlaps) return prev;
-
-      const newLink = createNewLink(doc.id, linkingCollectionId, linkingEntityId, selectionStart, selectionEnd);
-
-      const updatedDocs = prev.documents.map((d) =>
-        d.id === doc.id ? { ...d, entityLinks: [...d.entityLinks, newLink].sort((a, b) => a.start - b.start) } : d
-      );
-
-      const nextAfterLink: Project = { ...prev, documents: updatedDocs };
-      return upsertDialogueForLink(nextAfterLink, newLink);
-    });
 
     setActiveCollectionId(linkingCollectionId);
     setLinkingSelection(null);
     setLinkingCollectionId("");
     setLinkingEntityId("");
     setEditingLinkId(null);
-    setLinkingIsDialogue(false);
-    setLinkingDialogueFields(buildDefaultDialogueFieldValues(dialogueFieldDefs));
     setLinkingNotice(null);
   };
 
   const unlinkCurrentLink = () => {
-    if (!project || !activeDoc || !editingLinkId) return;
-
-    setProject((prev) => {
-      if (!prev) return prev;
-
-      const documents = prev.documents.map((d) =>
-        d.id === activeDoc.id ? { ...d, entityLinks: d.entityLinks.filter((l) => l.id !== editingLinkId) } : d
-      );
-
-      const dialogueEntries = prev.dialogueEntries.filter((e) => e.linkId !== editingLinkId);
-
-      return { ...prev, documents, dialogueEntries };
-    });
-
-    // ✅ #1: Highlights will now clear immediately thanks to StoryEditor signature-based repaint.
+    if (!editingLinkId) return;
+    linkApiRef.current?.unlink(editingLinkId);
     setLinkingSelection(null);
     setLinkingCollectionId("");
     setLinkingEntityId("");
     setEditingLinkId(null);
-    setLinkingIsDialogue(false);
-    setLinkingDialogueFields(buildDefaultDialogueFieldValues(dialogueFieldDefs));
     setLinkingNotice(null);
   };
 
@@ -7404,23 +7256,16 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     await exportDocumentsZip(format, documentIds);
   };
 
-  const exportDialogueJson = (docIds: Id[]) => {
+  const exportDatasetsJson = (datasetIds: Id[]) => {
     if (!project) {
       appModal.alert("No project loaded.", { title: "Export failed" });
       return;
     }
-
-    const dialogue = buildNestedDialogue(project, {
-      docIds: docIds.length > 0 && docIds.length < project.documents.length ? docIds : undefined,
-    });
-
-    const firstDoc = docIds.length > 0 ? project.documents.find((d) => docIds.includes(d.id)) : null;
-    const filename =
-      docIds.length === 0 || docIds.length === project.documents.length
-        ? "dialogue.json"
-        : `dialogue_${sanitizeSegment(firstDoc?.title ?? "") || firstDoc?.id || "chapter"}.json`;
-
-    downloadJson(filename, dialogue);
+    const chosen = getDatasets(project).filter((d) => datasetIds.includes(d.id));
+    for (const ds of chosen) {
+      const slug = sanitizeSegment(ds.name) || ds.id;
+      downloadJson(`${slug}.json`, buildDatasetFile(project, ds));
+    }
   };
 
 
@@ -7428,7 +7273,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   // a hash of the current project to the hash stored at the last sync (persisted in
   // sync.json), so this survives app restarts.
   const projectHash = useMemo(() => {
-    try { return hashString(JSON.stringify(project)); } catch { return ""; }
+    try { return project ? hashString(syncContentString(project)) : ""; } catch { return ""; }
   }, [project]);
   const localUnpushed = isDesktop && !!syncMeta?.syncedHash && projectHash !== syncMeta.syncedHash;
 
@@ -8075,10 +7920,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     </button>
                   )}
 
-                  <a
-                    href="https://forms.gle/P2NBsNxSXrJ8pMHG8"
-                    target="_blank"
-                    rel="noreferrer"
+                  <button
+                    type="button"
+                    onClick={() => { platform.openExternal("https://forms.gle/P2NBsNxSXrJ8pMHG8"); }}
                     style={{
                       borderRadius: 8,
                       border: "1px solid var(--border-3)",
@@ -8090,10 +7934,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       textAlign: "left",
                       textDecoration: "none",
                       display: "block",
+                      width: "100%",
                     }}
                   >
                     Contact Support
-                  </a>
+                  </button>
 
                   {isDesktop && syncSession && (
                     <button
@@ -8334,8 +8179,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    setDialogueFieldDefsDraft(getDialogueFieldDefs(project).map((d) => ({ ...d })));
-                    setDialogueFieldsModalOpen(true);
+                    const ds = getDatasets(project);
+                    const target = ds.find((d) => d.id === activeDatasetId) ?? ds[0];
+                    setShowDialogueTree(true);
+                    if (target) openDataset(target.id);
                     setFileMenuOpen(false);
                   }}
                   style={{
@@ -8351,7 +8198,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     marginBottom: 8,
                   }}
                 >
-                  Dialogue field settings…
+                  Conditions…
                 </button>
 
                 {/* Portable project transfer (web <-> desktop) */}
@@ -8446,7 +8293,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       <button
                         type="button"
                         onClick={() => {
-                          setExportDialogueDocIds(project?.documents.map((d) => d.id) ?? []);
+                          setExportDatasetIds(getDatasets(project).map((d) => d.id));
                           setExportDialogueModalOpen(true);
                           setExportMenuOpen(false);
                           setFileMenuOpen(false);
@@ -8464,7 +8311,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           textAlign: "left",
                         }}
                       >
-                        Export dialogue JSON
+                        Export condition JSON
                       </button>
 
                       <div style={{ height: 1, backgroundColor: "var(--border)", margin: "6px 0" }} />
@@ -8549,6 +8396,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   <>
                     <div style={{ height: 1, backgroundColor: "var(--border)", margin: "10px 0" }} />
                     {syncMeta ? (
+                      <>
                       <button
                         type="button"
                         onClick={syncNow}
@@ -8581,6 +8429,52 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                   : "linked"}
                         </span>
                       </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!syncIsPro) { requireSyncPro(); return; }
+                          setAutoSyncOnSave((v) => {
+                            const nv = !v;
+                            try { localStorage.setItem("evenstory_autosync", nv ? "1" : "0"); } catch { /* ignore */ }
+                            return nv;
+                          });
+                        }}
+                        title="Automatically push to your web account a few seconds after each save (Pro). Skipped when the web copy is newer, to avoid overwriting it."
+                        style={{
+                          width: "100%",
+                          marginTop: 6,
+                          borderRadius: 8,
+                          border: "1px solid var(--border-3)",
+                          backgroundColor: "transparent",
+                          color: "var(--text-2)",
+                          cursor: "pointer",
+                          padding: "8px 10px",
+                          fontSize: 13,
+                          textAlign: "left",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          gap: 10,
+                        }}
+                      >
+                        <span>Auto-sync on save</span>
+                        <span
+                          style={{
+                            flexShrink: 0,
+                            fontSize: 11,
+                            fontWeight: 700,
+                            borderRadius: 999,
+                            padding: "1px 8px",
+                            border: "1px solid " + (autoSyncOnSave ? "var(--accent)" : "var(--border-3)"),
+                            background: autoSyncOnSave ? "var(--accent-bg-2)" : "transparent",
+                            color: autoSyncOnSave ? "var(--accent-text)" : "var(--text-dim)",
+                          }}
+                        >
+                          {autoSyncOnSave ? "On" : "Off"}
+                        </span>
+                      </button>
+                      </>
                     ) : (
                       <button
                         type="button"
@@ -8744,7 +8638,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => { setShowDialogueTree((v) => !v); setViewMenuOpen(false); }}
                   style={viewMenuItemStyle}
                 >
-                  {showDialogueTree ? "Hide dialogue in sidebar" : "Show dialogue in sidebar"}
+                  {showDialogueTree ? "Hide conditions in sidebar" : "Show conditions in sidebar"}
                 </button>
 
                 {/* Theme */}
@@ -9043,6 +8937,33 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           </button>
                         );
                       })}
+
+                      {syncSession && launcherWebProjects.filter((p) => !linkedWebIds.has(p.id)).length > 0 && (
+                        <>
+                          <div style={{ height: 1, background: "var(--border)", margin: "6px 0" }} />
+                          <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-dim)", padding: "4px 8px" }}>
+                            From your web account
+                          </div>
+                          {launcherWebProjects.filter((p) => !linkedWebIds.has(p.id)).map((p) => (
+                            <button
+                              key={p.id}
+                              type="button"
+                              onClick={() => { setProjectSwitcherOpen(false); doPullProject(p.id); }}
+                              title="Import this project to a new folder on this device"
+                              style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", textAlign: "left", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "7px 8px", fontSize: 13 }}
+                            >
+                              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name || "Untitled"}</span>
+                              <span
+                                title="On your web account — click to import"
+                                style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, borderRadius: 999, padding: "1px 7px", border: "1px solid var(--accent)", background: "var(--accent-bg-2)", color: "var(--accent-text)" }}
+                              >
+                                ☁ Web
+                              </span>
+                            </button>
+                          ))}
+                        </>
+                      )}
+
                       <div style={{ height: 1, background: "var(--border)", margin: "6px 0" }} />
                       <button
                         type="button"
@@ -9750,8 +9671,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
               <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Export dialogue JSON</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>Choose which documents to export dialogue from.</div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>Export condition JSON</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>Choose which conditions to export as engine-readable JSON.</div>
               </div>
               <button
                 type="button"
@@ -9767,37 +9688,36 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <label style={{ fontSize: 12, opacity: 0.85 }}>Documents</label>
+                  <label style={{ fontSize: 12, opacity: 0.85 }}>Conditions</label>
                   <button
                     type="button"
                     onClick={() => {
-                      const allIds = project.documents.map((d) => d.id);
-                      setExportDialogueDocIds(exportDialogueDocIds.length === allIds.length ? [] : allIds);
+                      const allIds = getDatasets(project).map((d) => d.id);
+                      setExportDatasetIds(exportDatasetIds.length === allIds.length ? [] : allIds);
                     }}
                     style={{ fontSize: 12, background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0 }}
                   >
-                    {exportDialogueDocIds.length === project.documents.length ? "Deselect all" : "Select all"}
+                    {exportDatasetIds.length === getDatasets(project).length ? "Deselect all" : "Select all"}
                   </button>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 260, overflowY: "auto", border: "1px solid var(--border-2)", borderRadius: 8, padding: 8, background: "var(--bg-surface)" }}>
-                  {project.documents.map((d) => {
-                    const checked = exportDialogueDocIds.includes(d.id);
-                    const dialogueCount = project.dialogueEntries.filter((e: any) => e.documentId === d.id).length;
+                  {getDatasets(project).map((ds) => {
+                    const checked = exportDatasetIds.includes(ds.id);
                     return (
                       <label
-                        key={d.id}
+                        key={ds.id}
                         style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 6, cursor: "pointer", background: checked ? "var(--accent-sel)" : "transparent" }}
                       >
                         <input
                           type="checkbox"
                           checked={checked}
-                          onChange={() => setExportDialogueDocIds((prev) =>
-                            prev.includes(d.id) ? prev.filter((id) => id !== d.id) : [...prev, d.id]
+                          onChange={() => setExportDatasetIds((prev) =>
+                            prev.includes(ds.id) ? prev.filter((id) => id !== ds.id) : [...prev, ds.id]
                           )}
                           style={{ accentColor: "var(--accent)", width: 14, height: 14, flexShrink: 0 }}
                         />
-                        <span style={{ fontSize: 13, flex: 1 }}>{d.title}</span>
-                        <span style={{ fontSize: 11, opacity: 0.5 }}>{dialogueCount} line{dialogueCount !== 1 ? "s" : ""}</span>
+                        <span style={{ fontSize: 13, flex: 1 }}>{ds.name}</span>
+                        <span style={{ fontSize: 11, opacity: 0.5 }}>{ds.entries.length} entr{ds.entries.length !== 1 ? "ies" : "y"}</span>
                       </label>
                     );
                   })}
@@ -9814,14 +9734,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 </button>
                 <button
                   type="button"
-                  disabled={exportDialogueDocIds.length === 0}
+                  disabled={exportDatasetIds.length === 0}
                   onClick={() => {
-                    exportDialogueJson(exportDialogueDocIds);
+                    exportDatasetsJson(exportDatasetIds);
                     setExportDialogueModalOpen(false);
                   }}
-                  style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: exportDialogueDocIds.length === 0 ? "var(--bg-elevated)" : "var(--accent-bg)", color: exportDialogueDocIds.length === 0 ? "var(--text-dim)" : "var(--text)", cursor: exportDialogueDocIds.length === 0 ? "not-allowed" : "pointer", padding: "8px 14px", fontSize: 13, opacity: exportDialogueDocIds.length === 0 ? 0.6 : 1 }}
+                  style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: exportDatasetIds.length === 0 ? "var(--bg-elevated)" : "var(--accent-bg)", color: exportDatasetIds.length === 0 ? "var(--text-dim)" : "var(--text)", cursor: exportDatasetIds.length === 0 ? "not-allowed" : "pointer", padding: "8px 14px", fontSize: 13, opacity: exportDatasetIds.length === 0 ? 0.6 : 1 }}
                 >
-                  Export {exportDialogueDocIds.length > 0 && exportDialogueDocIds.length < project.documents.length ? `(${exportDialogueDocIds.length})` : ""}
+                  Export {exportDatasetIds.length > 0 ? `(${exportDatasetIds.length})` : ""}
                 </button>
               </div>
             </div>
@@ -10146,514 +10066,6 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 >
                   Export {exportDocumentsSelection.length > 0 && exportDocumentsSelection.length < project.documents.length ? `(${exportDocumentsSelection.length})` : ""}
                 </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {quoteDialogueModalOpen && quoteDialoguePending && project && activeDoc && charactersCollection && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            backgroundColor: "var(--overlay)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 110,
-            padding: 16,
-          }}
-        >
-          <div
-            id="quote-dialogue-modal"
-            style={{
-              width: 560,
-              maxWidth: "100%",
-              backgroundColor: "var(--bg-panel)",
-              border: "1px solid var(--border-2)",
-              borderRadius: 12,
-              padding: 14,
-              boxShadow: "0 12px 30px var(--overlay-2)",
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Link dialogue</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>
-                  You can later export all dialogue quotes alone for use in other applications.
-                </div>
-              </div>
-
-              <button
-                id="quote-dialogue-close-btn"
-                type="button"
-                onClick={() => {
-                  setQuoteDialogueModalOpen(false);
-                  setQuoteDialoguePending(null);
-                }}
-                style={{
-                  borderRadius: 8,
-                  border: "1px solid var(--border-3)",
-                  backgroundColor: "transparent",
-                  color: "var(--text-2)",
-                  cursor: "pointer",
-                  padding: "6px 10px",
-                  height: 34,
-                }}
-              >
-                Close
-              </button>
-            </div>
-
-            <div style={{ height: 1, backgroundColor: "var(--border)", margin: "12px 0" }} />
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <div style={{ fontSize: 12, opacity: 0.9 }}>
-                <div style={{ fontWeight: 700, marginBottom: 4 }}>Character</div>
-                <div style={{ opacity: 0.85 }}>
-                  {(() => {
-                    const row = charactersCollection.rows.find((r) => r.id === quoteDialoguePending.entityId);
-                    return row ? getRowLabel(row) : quoteDialoguePending.entityId;
-                  })()}
-                </div>
-              </div>
-
-              <div style={{ fontSize: 12, opacity: 0.9 }}>
-                <div style={{ fontWeight: 700, marginBottom: 4 }}>Dialogue text</div>
-                <div
-                  style={{
-                    border: "1px solid var(--border-2)",
-                    backgroundColor: "var(--bg-surface)",
-                    borderRadius: 10,
-                    padding: "10px 12px",
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                    whiteSpace: "pre-wrap",
-                    opacity: 0.9,
-                  }}
-                >
-                  {stripDialogueQuotes(activeDoc.content.slice(quoteDialoguePending.start, quoteDialoguePending.end))}
-                </div>
-              </div>
-
-              {dialogueFieldDefs.length > 0 && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.9 }}>Dialogue fields</div>
-
-                  {dialogueFieldDefs.map((def, idx) => {
-                    const v = quoteDialogueFields?.[def.id];
-                    const isNum = def.type === "number";
-                    const isBool = def.type === "bool";
-                    return (
-                      <div
-                        key={def.id}
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "160px 1fr",
-                          gap: 10,
-                          alignItems: "center",
-                        }}
-                      >
-                        <div style={{ fontSize: 12, opacity: 0.85 }}>{def.label}</div>
-                        {isBool ? (
-                          <input
-                            type="checkbox"
-                            checked={v === "true"}
-                            onChange={(e) => {
-                              setQuoteDialogueFields((prev) => ({
-                                ...(prev ?? {}),
-                                [def.id]: e.target.checked ? "true" : "false",
-                              }));
-                            }}
-                            style={{ width: 16, height: 16, justifySelf: "start" }}
-                          />
-                        ) : (
-                          <input
-                            ref={idx === 0 ? quoteDialogueFirstFieldRef : undefined}
-                            type={isNum ? "number" : "text"}
-                            value={v === undefined ? "" : String(v)}
-                            onChange={(e) => {
-                              const raw = e.target.value;
-                              setQuoteDialogueFields((prev) => ({
-                                ...(prev ?? {}),
-                                [def.id]: isNum ? (raw === "" ? "" : Number(raw)) : raw,
-                              }));
-                            }}
-                            style={{
-                              borderRadius: 8,
-                              border: "1px solid var(--border-2)",
-                              backgroundColor: "var(--bg-surface)",
-                              color: "var(--text)",
-                              padding: "8px 10px",
-                            }}
-                          />
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 4 }}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setQuoteDialogueModalOpen(false);
-                    setQuoteDialoguePending(null);
-                  }}
-                  style={{
-                    borderRadius: 8,
-                    border: "1px solid var(--border-3)",
-                    backgroundColor: "transparent",
-                    color: "var(--text-2)",
-                    cursor: "pointer",
-                    padding: "8px 10px",
-                    fontSize: 13,
-                  }}
-                >
-                  Cancel
-                </button>
-
-                <button
-                  type="button"
-                  onClick={confirmDialogueQuoteLink}
-                  style={{
-                    borderRadius: 8,
-                    border: "1px solid var(--accent)",
-                    backgroundColor: "var(--accent-bg)",
-                    color: "var(--text)",
-                    cursor: "pointer",
-                    padding: "8px 10px",
-                    fontSize: 13,
-                  }}
-                >
-                  Link dialogue
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {dialogueFieldsModalOpen && project && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            backgroundColor: "var(--overlay)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 100,
-            padding: 16,
-          }}
-        >
-          <div
-            style={{
-              width: 760,
-              maxWidth: "100%",
-              backgroundColor: "var(--bg-panel)",
-              border: "1px solid var(--border-2)",
-              borderRadius: 12,
-              padding: 14,
-              boxShadow: "0 12px 30px var(--overlay-2)",
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Dialogue fields</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>
-                  Customize metadata fields shown when linking dialogue lines (defaults: Stage, Interaction).
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => setDialogueFieldsModalOpen(false)}
-                style={{
-                  borderRadius: 8,
-                  border: "1px solid var(--border-3)",
-                  backgroundColor: "transparent",
-                  color: "var(--text-2)",
-                  cursor: "pointer",
-                  padding: "6px 10px",
-                  height: 34,
-                }}
-              >
-                Close
-              </button>
-            </div>
-
-            <div style={{ height: 1, backgroundColor: "var(--border)", margin: "12px 0" }} />
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {dialogueFieldDefsDraft.length === 0 && (
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  No fields defined. Dialogue links will have no extra metadata.
-                </div>
-              )}
-
-              {dialogueFieldDefsDraft.map((def, idx) => (
-                <div
-                  key={def.id}
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "1fr 120px 90px",
-                    gap: 8,
-                    alignItems: "center",
-                  }}
-                >
-                  <input
-                    value={def.label}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setDialogueFieldDefsDraft((prev) => prev.map((d, i) => (i === idx ? { ...d, label: v } : d)));
-                    }}
-                    style={{
-                      borderRadius: 8,
-                      border: "1px solid var(--border-2)",
-                      backgroundColor: "var(--bg-surface)",
-                      color: "var(--text)",
-                      padding: "8px 10px",
-                      fontSize: 14,
-                    }}
-                    placeholder="Label (e.g. Scene, Beat, Chapter)"
-                  />
-
-                  <select className="themed-select"
-                    value={def.type}
-                    onChange={(e) => {
-                      const v = e.target.value as "number" | "string" | "bool";
-                      setDialogueFieldDefsDraft((prev) => prev.map((d, i) => (i === idx ? { ...d, type: v } : d)));
-                    }}
-                    style={{
-                      borderRadius: 8,
-                      border: "1px solid var(--border-2)",
-                      background: "var(--bg-surface)",
-                      color: "var(--text)",
-                      padding: "8px 10px",
-                      fontSize: 14,
-                    }}
-                  >
-                    <option value="number">number</option>
-                    <option value="string">string</option>
-                    <option value="bool">bool</option>
-                  </select>
-
-                  <button
-                    type="button"
-                    onClick={() => setDialogueFieldDefsDraft((prev) => prev.filter((_, i) => i !== idx))}
-                    style={{
-                      borderRadius: 8,
-                      border: "1px solid var(--danger-border)",
-                      background: "var(--danger-bg)",
-                      color: "var(--danger-text)",
-                      padding: "8px 10px",
-                      cursor: "pointer",
-                      fontSize: 13,
-                    }}
-                  >
-                    Remove
-                  </button>
-                </div>
-              ))}
-
-              <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 12 }}>
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      color: "#a8a8a8",
-                      lineHeight: 1.45,
-                    }}
-                  >
-                    These fields define the exported dialogue tree. Earlier fields appear higher in the hierarchy.
-                  </div>
-
-                  <div
-                    style={{
-                      border: "1px solid var(--border-deep)",
-                      borderRadius: 10,
-                      background: "var(--bg-surface)",
-                      padding: 12,
-                    }}
-                  >
-                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim-2)", marginBottom: 8 }}>
-                      Export structure preview
-                    </div>
-
-                    <div
-                      style={{
-                        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                        fontSize: 12,
-                        lineHeight: 1.6,
-                        color: "#cfcfcf",
-                        whiteSpace: "pre-wrap",
-                      }}
-                    >
-                      <div>
-                        <span style={{ color: "#7fd1b9" }}>Character (name / ID)</span>
-                      </div>
-
-                      {dialogueFieldDefsDraft.map((def, idx) => (
-                        <div key={def.id || idx}>
-                          {"   ".repeat(idx)}
-                          {"└─ "}
-                          <span style={{ color: "var(--text)" }}>{String(def.label || "Field").trim() || "Field"}</span>
-                        </div>
-                      ))}
-
-                      <div>
-                        {"   ".repeat(dialogueFieldDefsDraft.length)}
-                        {"└─ "}
-                        <span style={{ color: "#ffb86c" }}>["Dialogue line", "Dialogue line"]</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div
-                  style={{
-                    border: "1px solid var(--border-deep)",
-                    borderRadius: 10,
-                    background: "var(--bg-surface)",
-                    padding: 12,
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 8,
-                    minHeight: 0,
-                  }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim-2)" }}>
-                    Path example
-                  </div>
-
-                  <div
-                    style={{
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                      fontSize: 12,
-                      lineHeight: 1.6,
-                      color: "var(--text-dim)",
-                      background: "var(--bg-deep)",
-                      border: "1px solid #252525",
-                      borderRadius: 8,
-                      padding: 10,
-                      overflowX: "auto",
-                    }}
-                  >
-                    dialogue["John"]
-                    {dialogueFieldDefsDraft.map((def, idx) => (
-                      <span key={def.id}>["{idx + 1}"]</span>
-                    ))}
-                  </div>
-
-                  <div style={{ marginTop: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDialogueFieldDefsDraft((prev) => {
-                          if (prev.length >= MAX_DIALOGUE_FIELDS) return prev;
-
-                          const used = new Set(prev.map((d) => String(d.id || "").trim()).filter(Boolean));
-                          const newId = makeUniqueDialogueFieldId(makeDialogueFieldId("New Field"), used);
-
-                          return [
-                            ...prev,
-                            { id: newId, label: "New Field", type: "number", defaultValue: 1 },
-                          ];
-                        });
-                      }}
-                      disabled={dialogueFieldDefsDraft.length >= MAX_DIALOGUE_FIELDS}
-                      title={dialogueFieldDefsDraft.length >= MAX_DIALOGUE_FIELDS ? "Maximum of 10 dialogue fields" : "Add field"}
-                      style={{
-                        borderRadius: 8,
-                        border: "1px solid var(--border-3)",
-                        backgroundColor: dialogueFieldDefsDraft.length >= MAX_DIALOGUE_FIELDS ? "var(--bg-elevated)" : "var(--bg-surface)",
-                        color: dialogueFieldDefsDraft.length >= MAX_DIALOGUE_FIELDS ? "var(--text-dim)" : "var(--text)",
-                        cursor: dialogueFieldDefsDraft.length >= MAX_DIALOGUE_FIELDS ? "not-allowed" : "pointer",
-                        padding: "8px 10px",
-                        fontSize: 13,
-                        opacity: dialogueFieldDefsDraft.length >= MAX_DIALOGUE_FIELDS ? 0.7 : 1,
-                      }}
-                    >
-                      + Field
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        const previousDefs = getDialogueFieldDefs(project);
-                        const usedIds = new Set<string>();
-
-                        const cleaned = dialogueFieldDefsDraft
-                          .map((d, idx) => {
-                            const label = String(d.label || "").trim() || "Field";
-                            const previousId = String(d.id || "").trim();
-                            const previousLabel = String(previousDefs[idx]?.label || "").trim();
-
-                            let nextId = previousId;
-
-                            if (!nextId || label !== previousLabel) {
-                              nextId = makeDialogueFieldId(label);
-                            }
-
-                            nextId = makeUniqueDialogueFieldId(nextId, usedIds);
-
-                            return {
-                              oldId: previousId,
-                              id: nextId,
-                              label,
-                              type: (d.type === "string" || d.type === "bool" ? d.type : "number") as "string" | "number" | "bool",
-                              defaultValue: d.defaultValue,
-                            };
-                          })
-                          .filter((d) => d.id);
-
-                        const cleanedDefs = cleaned.map(({ oldId, ...rest }) => rest);
-                        const idRemap = new Map<string, string>();
-                        for (const d of cleaned) {
-                          if (d.oldId && d.oldId !== d.id) {
-                            idRemap.set(d.oldId, d.id);
-                          }
-                        }
-
-                        const nextProject: Project = structuredClone(project);
-                        nextProject.dialogueFieldDefs = cleanedDefs;
-
-                        nextProject.dialogueEntries = (nextProject.dialogueEntries ?? []).map((e: any) => {
-                          const prevFields = e.fields && typeof e.fields === "object" ? e.fields : {};
-                          const remappedFields: Record<string, any> = {};
-
-                          for (const [key, value] of Object.entries(prevFields)) {
-                            remappedFields[idRemap.get(key) ?? key] = value;
-                          }
-
-                          return {
-                            ...e,
-                            fields: ensureDialogueFieldValues(cleanedDefs, remappedFields),
-                          };
-                        });
-
-                        setProject(nextProject);
-                        setLinkingDialogueFields(buildDefaultDialogueFieldValues(cleaned));
-                        setDialogueFieldsModalOpen(false);
-                        await saveProjectToSupabase(nextProject);
-                      }}
-                      style={{
-                        borderRadius: 8,
-                        border: "1px solid var(--accent)",
-                        backgroundColor: "var(--accent-bg)",
-                        color: "var(--text)",
-                        cursor: "pointer",
-                        padding: "8px 10px",
-                        fontSize: 13,
-                        marginLeft: "auto",
-                      }}
-                    >
-                      Save
-                    </button>
-                  </div>
-                </div>
               </div>
             </div>
           </div>
@@ -11543,42 +10955,63 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     {showDialogueTree && (
                       <>
                         <div style={{ height: 1, background: "var(--border)", margin: "14px 0" }} />
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                          <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>Dialogue</div>
-                          <span className="infoIcon" tabIndex={0} role="button" aria-label="About dialogue">
-                            i
-                            <span className="infoTooltip" role="tooltip">
-                              Dialogue you've linked in documents, grouped by character then your dialogue fields. View only for now.
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                            <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>Conditions</div>
+                            <span className="infoIcon" tabIndex={0} role="button" aria-label="About conditions">
+                              i
+                              <span className="infoTooltip" role="tooltip">
+                                Create conditions to give an output result. Click one to edit it.
+                              </span>
                             </span>
-                          </span>
+                          </div>
+                          <button type="button" className="iconBtn" onClick={addDataset} title="New condition">
+                            <IconNewDataset />
+                          </button>
                         </div>
 
                         <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 10 }}>
-                          {dialogueTreeRows.length === 0 && (
-                            <div style={{ fontSize: 12, opacity: 0.55, padding: "4px 6px" }}>No dialogue yet.</div>
+                          {datasetTreeRows.length === 0 && (
+                            <div style={{ fontSize: 12, opacity: 0.55, padding: "4px 6px" }}>No conditions yet.</div>
                           )}
-                          {dialogueTreeRows.map((row) => {
-                            if (row.kind === "line") {
-                              const canNavigate = !!row.linkId && !!row.docId;
+                          {datasetTreeRows.map((row) => {
+                            if (row.kind === "leaf") {
                               return (
                                 <div key={row.key} className="treeRow"
-                                  onClick={canNavigate ? () => navigateToDialogueLine(row.docId, row.linkId) : undefined}
-                                  title={canNavigate ? "Go to this line in the editor" : row.text}
-                                  style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 6 + row.depth * 14 + 4, paddingRight: 6, minHeight: 24, borderRadius: 6, cursor: canNavigate ? "pointer" : "default" }}>
+                                  onClick={() => openDataset(row.datasetId)}
+                                  title={row.text}
+                                  style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 6 + row.depth * 14 + 4, paddingRight: 6, minHeight: 24, borderRadius: 6, cursor: "pointer" }}>
                                   <span style={{ opacity: 0.4, flexShrink: 0 }}>›</span>
-                                  <span style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0, opacity: 0.7, fontStyle: "italic" }}>{row.text}</span>
+                                  <span style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0, opacity: 0.7 }}>{row.text}</span>
                                 </div>
                               );
                             }
-                            const key = row.path.join("/");
+                            if (row.kind === "dataset") {
+                              const selected = activeDatasetId === row.datasetId && rightShowsDataset;
+                              return (
+                                <div key={"ds:" + row.datasetId} className="treeRow"
+                                  onClick={() => openDataset(row.datasetId)}
+                                  onContextMenu={(e) => { e.preventDefault(); renameDataset(row.datasetId); }}
+                                  title="Open condition (right-click to rename)"
+                                  style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 6, paddingRight: 6, height: 26, cursor: "pointer", borderRadius: 6, color: "var(--text)", background: selected ? "var(--bg-row-sel)" : undefined }}>
+                                  <span
+                                    onClick={(e) => { e.stopPropagation(); setCollapsedDialogueGroups((p) => ({ ...p, ["ds:" + row.datasetId]: !(p["ds:" + row.datasetId] ?? true) })); }}
+                                    style={{ fontSize: 10, opacity: 0.7, width: 10, flexShrink: 0 }}
+                                  >{row.collapsed ? "▸" : "▾"}</span>
+                                  <span style={{ display: "flex", opacity: 0.6, flexShrink: 0 }}><IconChat /></span>
+                                  <span style={{ fontSize: 13, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>{row.name}</span>
+                                  <span style={{ fontSize: 11, opacity: 0.5, flexShrink: 0 }}>{row.count}</span>
+                                </div>
+                              );
+                            }
                             return (
-                              <div key={(row.kind === "char" ? "c:" : "f:") + key} className="treeRow"
-                                onClick={() => setCollapsedDialogueGroups((p) => ({ ...p, [key]: !(p[key] ?? true) }))}
+                              <div key={"g:" + row.key} className="treeRow"
+                                onClick={() => setCollapsedDialogueGroups((p) => ({ ...p, [row.key]: !(p[row.key] ?? true) }))}
                                 style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 6 + row.depth * 14, paddingRight: 6, height: 26, cursor: "pointer", borderRadius: 6, color: "var(--text-2)" }}>
                                 <span style={{ fontSize: 10, opacity: 0.7, width: 10, flexShrink: 0 }}>{row.collapsed ? "▸" : "▾"}</span>
-                                <span style={{ display: "flex", opacity: 0.6, flexShrink: 0 }}>{row.kind === "char" ? <IconChat /> : <IconFolder />}</span>
-                                <span style={{ fontSize: 13, fontWeight: row.kind === "char" ? 700 : 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
-                                  {row.kind === "field" && row.fieldLabel && (
+                                <span style={{ display: "flex", opacity: 0.6, flexShrink: 0 }}><IconFolder /></span>
+                                <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
+                                  {row.fieldLabel && (
                                     <span style={{ opacity: 0.5, fontWeight: 500 }}>{row.fieldLabel}: </span>
                                   )}
                                   {row.label}
@@ -11725,23 +11158,6 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                             </select>
                           </div>
 
-                          <label className="linkCheckRow">
-                            <input
-                              type="checkbox"
-                              checked={linkingIsDialogue}
-                              onChange={(e) => {
-                                const next = e.target.checked;
-                                setLinkingIsDialogue(next);
-                                if (next) {
-                                  setLinkingDialogueFields((prev) => ensureDialogueFieldValues(dialogueFieldDefs, prev));
-                                }
-                              }}
-                            />
-                            Treat as dialogue line
-                          </label>
-
-                          {linkingIsDialogue && <div className="linkDialogueRow">{renderDialogueFieldInputs()}</div>}
-
                           <div className="linkDivider" />
 
                           <div className="linkActions">
@@ -11795,14 +11211,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       entityLinks={activeDoc?.entityLinks ?? []}
                       getCollectionColor={getCollectionColor}
                       onHighlightClick={handleHighlightClick}
-                      scrollToLinkId={scrollToLinkId}
-                      scrollNonce={scrollNonce}
+                      onLinksChange={(links) => activeDoc && updateDocumentLinks(activeDoc.id, links)}
+                      linkApiRef={linkApiRef}
                       slashItems={slashItems}
                       onSlashLinkCreate={handleSlashLinkCreate}
                       enableSlashLinking={true}
-                      dialogueQuoteItems={dialogueQuoteItems}
-                      onDialogueQuoteLinkCreate={handleDialogueQuoteLinkCreate}
-                      enableDialogueQuoteLinking={true}
+                      enableDialogueQuoteLinking={false}
                     />
                   </div>
                 </div>
@@ -11815,6 +11229,22 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             {/* RIGHT */}
             {showRightPanel && (
               <Panel id="right-panel" order={3} defaultSize={panelSizes[2] ?? (layoutMode === "dual" ? 40 : 80)} minSize={20}>
+                {rightShowsDataset ? (
+                  activeDataset ? (
+                    <DatasetView
+                      dataset={activeDataset}
+                      collections={project.collections}
+                      onChange={updateDataset}
+                      onRename={() => renameDataset(activeDataset.id)}
+                      onDelete={() => deleteDataset(activeDataset.id)}
+                      getRowLabel={getRowLabel}
+                    />
+                  ) : (
+                    <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.6, fontSize: 13 }}>
+                      No dataset selected.
+                    </div>
+                  )
+                ) : (
                 <div style={{ height: "100%", padding: "12px 16px", boxSizing: "border-box", overflow: "auto" }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
                     <div style={{ fontWeight: 800, fontSize: 14 }}>
@@ -12340,7 +11770,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                         );
                                       })()
                                     ) : (
-                                      f.type === "text" ? (
+                                      f.type === "bool" ? (
+                                        <input
+                                          type="checkbox"
+                                          data-cellkey={`${activeCollection.id}:${r.id}:${f.id}`}
+                                          checked={r.values[f.id] === "true" || r.values[f.id] === 1}
+                                          onChange={(e) =>
+                                            updateCollectionCell(activeCollection.id, r.id, f.id, e.target.checked ? "true" : "false")
+                                          }
+                                          style={{ width: 16, height: 16 }}
+                                        />
+                                      ) : f.type === "text" ? (
                                         <textarea
                                           data-cellkey={`${activeCollection.id}:${r.id}:${f.id}`}
                                           value={String(r.values[f.id] ?? "")}
@@ -12523,6 +11963,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     </div>
                   ) : null}
                 </div>
+                )}
               </Panel>
             )}
           </PanelGroup>

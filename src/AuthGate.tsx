@@ -1188,10 +1188,12 @@ export const AuthGate: React.FC = () => {
       const renderInlineNode = (node: any, key: string): React.ReactNode => {
         const t = String(node?.type ?? "");
 
-        if (t === "text") {
+        if (t === "text" || t === "entity-link") {
           // Keep the text exactly as stored (incl. any zero-width spaces) so the
           // offsets here match doc.content, which is built the same way. Stripping
           // them would shift every following link right by one (dropping a char).
+          // entity-link chips are TextNode subclasses, so the same text payload +
+          // offset logic applies; the link itself comes from snapshot.entityLinks.
           const rawText = String(node?.text ?? "");
           const start = globalOffset;
           const end = start + rawText.length;

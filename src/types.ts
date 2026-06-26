@@ -6,7 +6,7 @@ export type CollectionKind = "generic" | "characters";
 export interface CollectionField {
   id: Id;
   label: string;
-  type: "string" | "number" | "text";
+  type: "string" | "number" | "text" | "bool";
 }
 
 export interface AssetFile {
@@ -77,25 +77,59 @@ export interface Document {
   timelinePos?: number; // ✅ NEW (integer slot on timeline)
 }
 
-// User-configurable dialogue metadata fields (defaults: Stage, Interaction)
-export interface DialogueFieldDef {
-  id: Id; // stable key used in saved dialogue entry fields
+// ── Datasets ───────────────────────────────────────────────────────────────
+// A "dataset" generalizes the old Dialogue feature: a set of user-defined fields
+// (e.g. Stage, Interaction) that index into a result. The default project ships a
+// "Dialogue" dataset whose results are text lines, but a dataset's result can also
+// be a plain typed value or a value coupled to a record's column.
+
+export type DatasetFieldType = "number" | "string" | "bool";
+
+// User-configurable dataset index fields (Dialogue defaults: Stage, Interaction).
+export interface DatasetFieldDef {
+  id: Id; // stable key used in saved entry.fields
   label: string; // user-facing label (e.g. "Stage", "Scene", "Chapter")
-  type: "number" | "string" | "bool";
+  type: DatasetFieldType;
   defaultValue?: number | string;
 }
 
+// Per-entry result. Chosen independently per entry.
+//  - "text":   free text (a dialogue line)
+//  - "value":  a plain typed value (no record coupling)
+//  - "column": a value written to a specific record's column; its type follows
+//              that column (string/number/bool). Reads like "<record>.<field> = value".
+export type DatasetResult =
+  | { kind: "text"; value: string }
+  | { kind: "value"; valueType: DatasetFieldType; value: string | number }
+  | { kind: "column"; collectionId: Id; entityId: Id; fieldId: Id; value: string | number };
+
+export interface DatasetEntry {
+  id: Id;
+  // Optional subject entity (for the Dialogue dataset this is the speaker).
+  subjectCollectionId?: Id;
+  subjectEntityId?: Id;
+  fields: Record<string, string | number>;
+  result: DatasetResult;
+}
+
+export interface Dataset {
+  id: Id;
+  name: string;
+  fieldDefs: DatasetFieldDef[];
+  entries: DatasetEntry[];
+}
+
+// Back-compat alias: existing imports referenced DialogueFieldDef.
+export type DialogueFieldDef = DatasetFieldDef;
+
+// Legacy dialogue entry shape (older saves / pre-dataset). Only read during
+// migration in normalizeLoadedProject — not used as a live model anymore.
 export interface DialogueEntry {
   id: Id;
   linkId?: Id;
-
-  // New (generic speaker reference)
   speakerCollectionId?: Id;
   speakerEntityId?: Id;
-
-  // Legacy (older saves): keep for backward compatibility
   characterId?: Id;
-
   documentId: Id;
   fields: Record<string, string | number>;
   text: string;
@@ -184,9 +218,10 @@ export interface ProjectViewSettings {
   uiShowMiddlePanel?: boolean; // legacy
   uiShowRightPanel?: boolean;  // legacy
   uiLayoutMode?: "focus" | "dual";        // sidebar + one editor, or both side-by-side
-  uiFocusView?: "doc" | "collection";     // which editor focus mode shows
+  uiFocusView?: "doc" | "collection" | "dataset"; // which editor focus mode shows
   uiShowAssetsTree?: boolean;  // Assets tree in the left sidebar
-  uiShowDialogueTree?: boolean; // Dialogue tree in the left sidebar
+  uiShowDialogueTree?: boolean; // Datasets tree in the left sidebar
+  activeDatasetId?: Id;        // selected dataset for the Dataset view
 
   // ✅ Persist timeline overlay height
   uiTimelineHeight?: number;
@@ -223,9 +258,12 @@ export interface Project {
   documentFolders?: string[][];
   collectionFolders?: string[][];
 
-  dialogueEntries: DialogueEntry[];
+  // Canonical store for the generalized Dialogue/Datasets feature. The first
+  // dataset (id "dialogue") is the default Dialogue dataset.
+  datasets: Dataset[];
 
-  // Defines which dialogue fields exist + their labels (user-editable under File menu)
+  // Legacy fields — only present on old saves; migrated into `datasets` on load.
+  dialogueEntries?: DialogueEntry[];
   dialogueFieldDefs?: DialogueFieldDef[];
 
   view?: ProjectViewSettings;

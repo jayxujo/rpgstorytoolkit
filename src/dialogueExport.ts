@@ -1,67 +1,96 @@
-import type { Project } from "./types";
+import type { Project, Dataset, DatasetEntry, DatasetResult, DatasetFieldType } from "./types";
 
-// The character key for a dialogue entry: the linked entity's Name, falling back
-// to its collection ID field (e.g. "JOHN"), then the internal id.
-export function dialogueCharKey(project: Project, entry: any): string {
-  const colId = entry?.speakerCollectionId ?? entry?.collectionId;
-  const entId = entry?.speakerEntityId ?? entry?.entityId ?? entry?.characterId;
+// The subject key for a dataset entry (used for grouping / the top level of the
+// dialogue tree): the linked entity's Name, falling back to its ID field, then id.
+export function datasetSubjectKey(project: Project, entry: DatasetEntry | any): string {
+  const colId = entry?.subjectCollectionId ?? entry?.speakerCollectionId ?? entry?.collectionId;
+  const entId = entry?.subjectEntityId ?? entry?.speakerEntityId ?? entry?.entityId ?? entry?.characterId;
   const col = colId ? project.collections.find((c) => c.id === colId) : null;
   const row = col?.rows.find((r) => r.id === entId);
   if (row) return String(row.values["name"] || row.values["id"] || row.id);
   return String(entId ?? "Unknown");
 }
 
-// Builds the engine-readable dialogue file. The structure is self-describing so a
-// game engine knows what each nesting level means (rather than guessing from depth):
-//   {
-//     "format": "rpgst.dialogue.v1",
-//     "fields": ["speaker", "Stage", "Interaction"],   // names each level, top to bottom
-//     "dialogue": { "<speaker>": { "<Stage value>": { "<Interaction value>": ["line", ...] } } }
-//   }
-// `fields[0]` is always the speaker (the linked entity's name/ID); the rest are the
-// dialogue field labels in order. The leaf at the deepest level is an array of lines.
-export interface NestedDialogueFile {
-  format: "rpgst.dialogue.v1";
-  fields: string[];
-  dialogue: Record<string, any>;
+// Back-compat alias.
+export const dialogueCharKey = datasetSubjectKey;
+
+// Coerce a stored value (always string|number internally) to a typed JSON value.
+function coerceTyped(type: DatasetFieldType, value: string | number): string | number | boolean {
+  if (type === "bool") return value === "true" || value === 1;
+  if (type === "number") return Number(value) || 0;
+  return String(value ?? "");
 }
 
-export function buildNestedDialogue(project: Project, opts?: { docIds?: string[] }): NestedDialogueFile {
-  const fieldDefs = project.dialogueFieldDefs ?? [];
-  const docIds = opts?.docIds;
-  const entries = (project.dialogueEntries ?? []).filter(
-    (e) => !docIds || docIds.includes(e.documentId)
-  );
+// ── Condition file ───────────────────────────────────────────────────────────
+// For non-dialogue conditions: each leaf is an array of result objects, which may be
+// free text, a plain typed value, or a value coupled to a record's column.
+export interface DatasetFile {
+  // Index field labels, top-to-bottom. Prefixed with "subject" when any entry
+  // sets a subject entity (mirrors how the dialogue file leads with "speaker").
+  fields: string[];
+  results: Record<string, any>;
+}
 
-  const dialogue: Record<string, any> = {};
+function serializeResult(project: Project, r: DatasetResult | undefined): any {
+  if (!r) return { kind: "value", type: "string", value: "" };
+  if (r.kind === "text") return { kind: "text", value: String(r.value ?? "") };
+  if (r.kind === "value") {
+    return { kind: "value", type: r.valueType, value: coerceTyped(r.valueType, r.value) };
+  }
+  // column
+  const col = project.collections.find((c) => c.id === r.collectionId);
+  const row = col?.rows.find((rr) => rr.id === r.entityId);
+  const field = col?.schema.find((f) => f.id === r.fieldId);
+  const fType: DatasetFieldType =
+    field?.type === "number" ? "number" : field?.type === "bool" ? "bool" : "string";
+  return {
+    kind: "column",
+    collection: col?.name ?? r.collectionId,
+    record: row ? String(row.values["name"] || row.values["id"] || row.id) : r.entityId,
+    field: field?.label ?? r.fieldId,
+    type: fType,
+    value: coerceTyped(fType, r.value),
+  };
+}
+
+export function buildDatasetFile(project: Project, dataset: Dataset): DatasetFile {
+  const fieldDefs = dataset.fieldDefs ?? [];
+  const entries = dataset.entries ?? [];
+  const hasSubject = entries.some((e) => e.subjectEntityId);
+
+  const data: Record<string, any> = {};
   for (const entry of entries) {
-    const charKey = dialogueCharKey(project, entry);
-    const text = String(entry.text ?? "");
+    const levels: string[] = [];
+    if (hasSubject) levels.push(datasetSubjectKey(project, entry));
+    for (const def of fieldDefs) levels.push(String(entry.fields?.[def.id] ?? ""));
 
-    if (fieldDefs.length === 0) {
-      if (!Array.isArray(dialogue[charKey])) dialogue[charKey] = [];
-      (dialogue[charKey] as string[]).push(text);
+    const serialized = serializeResult(project, entry.result);
+
+    if (levels.length === 0) {
+      if (!Array.isArray(data["_"])) data["_"] = [];
+      data["_"].push(serialized);
       continue;
     }
 
-    if (!dialogue[charKey] || Array.isArray(dialogue[charKey])) dialogue[charKey] = {};
-    let node: any = dialogue[charKey];
-    for (let i = 0; i < fieldDefs.length; i++) {
-      const val = String(entry.fields?.[fieldDefs[i].id] ?? "");
-      if (i === fieldDefs.length - 1) {
-        if (!Array.isArray(node[val])) node[val] = [];
-        node[val].push(text);
+    let node: any = data;
+    for (let i = 0; i < levels.length; i++) {
+      const key = levels[i];
+      if (i === levels.length - 1) {
+        if (!Array.isArray(node[key])) node[key] = [];
+        node[key].push(serialized);
       } else {
-        if (!node[val] || Array.isArray(node[val])) node[val] = {};
-        node = node[val];
+        if (!node[key] || Array.isArray(node[key])) node[key] = {};
+        node = node[key];
       }
     }
   }
 
   return {
-    format: "rpgst.dialogue.v1",
-    // Level 0 is the speaker; the remaining levels are the dialogue fields in order.
-    fields: ["speaker", ...fieldDefs.map((d) => d.label || d.id)],
-    dialogue,
+    fields: [...(hasSubject ? ["subject"] : []), ...fieldDefs.map((d) => d.label || d.id)],
+    results: data,
   };
 }
+
+// The id of the default seed condition ("Dialogue"). Only used to give it a stable
+// id on migration — it is otherwise a perfectly ordinary condition.
+export const DIALOGUE_DATASET_ID = "dialogue";

@@ -4,7 +4,7 @@ import type { Platform, PlatformUser, PlatformProfile, LoadedProject } from './t
 import type { Project, Collection } from '../types';
 import { toSlug, docVaultSegments, colVaultSegments } from './slugify';
 import { richContentToMarkdown, type ResolvedLink } from './docMarkdown';
-import { buildNestedDialogue } from '../dialogueExport';
+import { buildDatasetFile } from '../dialogueExport';
 import { createSeedProject, DEFAULT_PROJECT_NAME } from './seedProject';
 import type { EntityLink } from '../types';
 
@@ -261,6 +261,9 @@ export interface VaultSyncMeta {
   // Hash of the project as it was at the last sync, so we can detect local edits
   // made since (even across app restarts).
   syncedHash?: string;
+  // Web storage paths of assets already uploaded at the last sync, so a push only
+  // re-uploads new/changed assets instead of every asset every time.
+  syncedAssetPaths?: string[];
 }
 
 export async function getVaultSyncMeta(vault?: string): Promise<VaultSyncMeta | null> {
@@ -431,8 +434,33 @@ async function syncRenames(vault: string, prev: Project, next: Project): Promise
 }
 
 async function writeGameFiles(vault: string, project: Project): Promise<void> {
-  await fsMkdir(joinPath(vault, "dialogue"));
-  await fsWrite(joinPath(vault, "dialogue", "dialogue.json"), JSON.stringify(buildNestedDialogue(project), null, 2));
+  // Every condition (incl. Dialogue) is written to conditions/<slug>.json.
+  const datasets = project.datasets ?? [];
+  await fsMkdir(joinPath(vault, "conditions"));
+  const usedFiles = new Set<string>();
+  for (const ds of datasets) {
+    let slug = toSlug(ds.name) || ds.id;
+    while (usedFiles.has(`${slug}.json`)) slug = `${slug}_2`;
+    usedFiles.add(`${slug}.json`);
+    await fsWrite(joinPath(vault, "conditions", `${slug}.json`), JSON.stringify(buildDatasetFile(project, ds), null, 2));
+  }
+
+  // Prune stale condition files (from renamed/deleted conditions) so the folder mirrors state.
+  try {
+    const existing = await invoke<string[]>('list_dir', { path: joinPath(vault, "conditions") });
+    for (const name of existing) {
+      if (name.endsWith('.json') && !usedFiles.has(name)) {
+        await invoke('delete_file', { path: joinPath(vault, "conditions", name) }).catch(() => {});
+      }
+    }
+  } catch { /* list_dir unavailable on older desktop builds */ }
+
+  // Migrate away from the old folder names (dialogue/ and the earlier datasets/).
+  for (const old of ["dialogue", "datasets"]) {
+    if (await fsExists(joinPath(vault, old))) {
+      await invoke('trash_path', { path: joinPath(vault, old) }).catch(() => {});
+    }
+  }
 
   // One-time migration: the tables folder was previously named "collections".
   if ((await fsExists(joinPath(vault, "collections"))) && !(await fsExists(joinPath(vault, "tables")))) {
@@ -480,6 +508,10 @@ async function writeGameFiles(vault: string, project: Project): Promise<void> {
 // ── Platform implementation ────────────────────────────────────────────────
 
 export const desktopPlatform: Platform = {
+  async openExternal(url: string): Promise<void> {
+    await invoke('open_url', { url });
+  },
+
   async getUser(): Promise<PlatformUser | null> {
     return LOCAL_USER;
   },

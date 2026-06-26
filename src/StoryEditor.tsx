@@ -32,8 +32,20 @@ import {
 } from "lexical";
 import { HeadingNode, $createHeadingNode } from "@lexical/rich-text";
 import { $setBlocksType } from "@lexical/selection";
+import { EntityLinkNode, $isEntityLinkNode } from "./editor/EntityLinkNode";
+import { wrapRangeAsChip, collectLinksAndText } from "./editor/linkEngine";
 
 import type { Id, EntityLink } from "./types";
+
+// Imperative handle the host (App) uses to mutate links inside the live editor.
+export interface LinkEditorApi {
+  // Replace the text in [start,end) with a chip for the given record.
+  wrapRange: (start: number, end: number, chipText: string, data: { linkId: string; collectionId: string; entityId: string; linkMode: "label" | "text"; color?: string }) => void;
+  // Re-point an existing chip at a different record (relabel = set text to label).
+  updateLink: (linkId: string, data: { collectionId: string; entityId: string; label: string; color?: string; relabel: boolean }) => void;
+  // Turn the chip with this linkId back into plain text.
+  unlink: (linkId: string) => void;
+}
 
 const HIDDEN_LINE_MARKER = "\u200B";
 
@@ -53,20 +65,41 @@ const collapseExcessBlankParagraphs = (s: string): string => {
   return t.replace(/\n{3,}/g, "\n\n");
 };
 
-const SyncExternalValuePlugin: React.FC<{ docKey: string; value: string; richValue?: string }> = ({
-  docKey,
-  value,
-  richValue,
-}) => {
+const SyncExternalValuePlugin: React.FC<{
+  docKey: string;
+  value: string;
+  richValue?: string;
+  lastEmittedRichRef?: React.MutableRefObject<string>;
+}> = ({ docKey, value, richValue, lastEmittedRichRef }) => {
   const [editor] = useLexicalComposerContext();
   const lastDocKeyRef = React.useRef<string>("");
 
   React.useEffect(() => {
-    // Only sync when switching documents.
-    if (lastDocKeyRef.current === docKey) return;
-    lastDocKeyRef.current = docKey;
-
+    const switchingDoc = lastDocKeyRef.current !== docKey;
     const incomingRich = richValue ?? "";
+
+    // When NOT switching documents, only reload for an EXTERNAL richContent change
+    // (e.g. a record rename rewriting chips). Changes the editor itself emitted match
+    // lastEmittedRich, so they don't trigger a disruptive reload mid-typing.
+    if (!switchingDoc) {
+      if (
+        lastEmittedRichRef &&
+        incomingRich &&
+        incomingRich.trim().startsWith("{") &&
+        incomingRich !== lastEmittedRichRef.current
+      ) {
+        try {
+          editor.setEditorState(editor.parseEditorState(incomingRich));
+          lastEmittedRichRef.current = incomingRich;
+        } catch {
+          /* ignore */
+        }
+      }
+      return;
+    }
+
+    lastDocKeyRef.current = docKey;
+    if (lastEmittedRichRef) lastEmittedRichRef.current = incomingRich;
 
     // Prefer rich state if present + parseable. Fall back to plain text.
     if (incomingRich && incomingRich.trim().startsWith("{")) {
@@ -106,7 +139,7 @@ const SyncExternalValuePlugin: React.FC<{ docKey: string; value: string; richVal
         root.append(p);
       }
     });
-  }, [editor, docKey]);
+  }, [editor, docKey, richValue, lastEmittedRichRef]);
 
   return null;
 };
@@ -307,6 +340,12 @@ interface StoryEditorProps {
   entityLinks?: EntityLink[];
   getCollectionColor?: (collectionId: Id) => string | undefined;
   onHighlightClick?: (linkId: Id, anchorRect: DOMRect) => void;
+
+  // Links are now chips inside the document; the editor derives the offset index and
+  // reports it up so downstream consumers (wiki/export/timeline) stay in sync.
+  onLinksChange?: (links: EntityLink[]) => void;
+  // Imperative handle for creating/removing links from the host's link popover.
+  linkApiRef?: React.MutableRefObject<LinkEditorApi | null>;
 
   // Programmatic "scroll to & open this link" (e.g. from the sidebar dialogue tree).
   // Bump scrollNonce to re-trigger even for the same linkId.
@@ -768,190 +807,79 @@ const CaretLinkListenerPlugin: React.FC<{
 };
 
 
-type ColoredLink = EntityLink & { color: string };
-
-const HighlightLinksPlugin: React.FC<{
-  links: EntityLink[];
-  getCollectionColor: (collectionId: Id) => string | undefined;
-  onHighlightClick: (linkId: Id, anchorRect: DOMRect) => void;
-  scrollToLinkId?: Id | null;
-  scrollNonce?: number;
-}> = ({ links, getCollectionColor, onHighlightClick, scrollToLinkId, scrollNonce }) => {
+const LinkApiPlugin: React.FC<{
+  linkApiRef?: React.MutableRefObject<LinkEditorApi | null>;
+  onHighlightClick?: (linkId: Id, anchorRect: DOMRect) => void;
+}> = ({ linkApiRef, onHighlightClick }) => {
   const [editor] = useLexicalComposerContext();
-  const nodeToLinkRef = React.useRef<Map<NodeKey, Id>>(new Map());
-
-  // A stable signature to ensure we repaint highlights immediately even if the array reference is reused
-  const linksSignature = useMemo(() => {
-    if (!links || links.length === 0) return "none";
-    return links
-      .map((l) => `${l.id}:${l.collectionId}:${l.entityId}:${l.start}-${l.end}`)
-      .join("|");
-  }, [links]);
 
   React.useEffect(() => {
-    editor.update(() => {
-      const root = $getRoot();
-
-      // Collect text nodes (in reading order) + their global offsets (matches root.getTextContent()).
-      const { nodes: textNodes, starts } = buildTextNodeIndex(root);
-      const nodeStartMap = new Map<NodeKey, number>();
-      for (let i = 0; i < textNodes.length; i++) {
-        nodeStartMap.set(textNodes[i].getKey(), starts[i]);
-      }
-
-      // Always clear previous styling immediately
-      for (const n of textNodes) n.setStyle("");
-      nodeToLinkRef.current.clear();
-
-      if (!links || links.length === 0) return;
-
-      const coloredLinks: ColoredLink[] = links
-        .map((l) => {
-          const color = getCollectionColor(l.collectionId);
-          return color ? ({ ...l, color } as ColoredLink) : null;
-        })
-        .filter(Boolean) as ColoredLink[];
-
-      if (coloredLinks.length === 0) return;
-
-      coloredLinks.sort((a, b) => a.start - b.start);
-
-      // Two-pointer sweep: per node compute all overlapping segments
-      let linkIdx = 0;
-
-      for (const node of textNodes) {
-        const key = node.getKey();
-        const nodeStart = nodeStartMap.get(key);
-        if (nodeStart == null) continue;
-
-        const len = node.getTextContentSize();
-        const nodeEnd = nodeStart + len;
-
-        while (linkIdx < coloredLinks.length && coloredLinks[linkIdx].end <= nodeStart) {
-          linkIdx++;
-        }
-
-        let j = linkIdx;
-        const segs: Array<{ localStart: number; localEnd: number; color: string; linkId: Id }> = [];
-
-        while (j < coloredLinks.length && coloredLinks[j].start < nodeEnd) {
-          const link = coloredLinks[j];
-          const overlapStart = Math.max(link.start, nodeStart);
-          const overlapEnd = Math.min(link.end, nodeEnd);
-
-          if (overlapEnd > overlapStart) {
-            segs.push({
-              localStart: overlapStart - nodeStart,
-              localEnd: overlapEnd - nodeStart,
-              color: link.color,
-              linkId: link.id,
-            });
+    if (!linkApiRef) return;
+    linkApiRef.current = {
+      wrapRange: (start, end, chipText, data) => {
+        editor.update(() => {
+          wrapRangeAsChip(start, end, chipText, data);
+        });
+      },
+      updateLink: (linkId, data) => {
+        editor.update(() => {
+          const stack: any[] = [...$getRoot().getChildren()];
+          while (stack.length) {
+            const n = stack.shift();
+            if ($isEntityLinkNode(n)) {
+              if (n.getLinkId() === linkId) {
+                n.setEntityRef(data.collectionId, data.entityId);
+                if (data.color) n.setColor(data.color);
+                if (data.relabel) {
+                  n.setLinkMode("label");
+                  n.setTextContent(data.label);
+                }
+              }
+            } else if ($isElementNode(n)) {
+              stack.unshift(...n.getChildren());
+            }
           }
-          j++;
-        }
-
-        if (segs.length === 0) continue;
-
-        // Apply segments from right->left so split indexes remain valid
-        segs.sort((a, b) => a.localStart - b.localStart);
-        let workingNode: TextNode = node;
-
-        for (let si = segs.length - 1; si >= 0; si--) {
-          const seg = segs[si];
-          const start = seg.localStart;
-          const end = seg.localEnd;
-
-          if (end <= start) continue;
-
-          const anyNode: any = workingNode;
-          const parts: TextNode[] = anyNode.splitText(start, end);
-
-          let segmentNode: TextNode;
-          if (parts.length === 3) {
-            segmentNode = parts[1];
-          } else if (parts.length === 2) {
-            segmentNode = start === 0 ? parts[0] : parts[1];
-          } else {
-            segmentNode = parts[0];
+        });
+      },
+      unlink: (linkId) => {
+        editor.update(() => {
+          const stack: any[] = [...$getRoot().getChildren()];
+          while (stack.length) {
+            const n = stack.shift();
+            if ($isEntityLinkNode(n)) {
+              if (n.getLinkId() === linkId) {
+                const plain = $createTextNode(n.getTextContent());
+                plain.setFormat(n.getFormat());
+                n.replace(plain);
+              }
+            } else if ($isElementNode(n)) {
+              stack.unshift(...n.getChildren());
+            }
           }
-
-          segmentNode.setStyle(
-            `border-bottom: 2px solid ${seg.color}; color: ${seg.color}; cursor: pointer;`
-          );
-          nodeToLinkRef.current.set(segmentNode.getKey(), seg.linkId);
-
-          if (start === 0) {
-            // nothing left of this segment inside this node
-            break;
-          }
-
-          // continue styling earlier segments in the left prefix
-          workingNode = parts[0];
-        }
-      }
-    });
-  }, [editor, linksSignature, getCollectionColor]);
-
-  React.useEffect(() => {
-    const rootElem = editor.getRootElement();
-    if (!rootElem) return;
-
-    const handleClick = (event: MouseEvent) => {
-      const domNode = event.target as Node;
-      // Capture the rect of the clicked element BEFORE the async editor.update
-      const anchorRect = (event.target as HTMLElement).getBoundingClientRect?.() ?? null;
-      editor.update(() => {
-        const lexicalNode = $getNearestNodeFromDOMNode(domNode);
-        if (!$isTextNode(lexicalNode)) return;
-
-        const key = lexicalNode.getKey();
-        const linkId = nodeToLinkRef.current.get(key);
-        if (linkId && anchorRect) {
-          recentLinkClickBaton.t = Date.now();
-          onHighlightClick(linkId, anchorRect);
-        }
-      });
+        });
+      },
     };
-
-    rootElem.addEventListener("click", handleClick);
-    return () => rootElem.removeEventListener("click", handleClick);
-  }, [editor, onHighlightClick]);
-
-  // Programmatic navigation: when asked, scroll the styled segment for a given link
-  // into view and open its popover (reuses the same path as a manual highlight click).
-  React.useEffect(() => {
-    if (!scrollToLinkId || !scrollNonce) return;
-
-    // After a document switch the content sync + highlight pass may not have applied yet,
-    // so poll briefly until the styled segment for this link exists in the DOM.
-    let cancelled = false;
-    let attempts = 0;
-    const tick = () => {
-      if (cancelled) return;
-      attempts++;
-      let foundKey: NodeKey | null = null;
-      for (const [key, id] of nodeToLinkRef.current.entries()) {
-        if (id === scrollToLinkId) {
-          foundKey = key;
-          break;
-        }
-      }
-      const el = foundKey ? editor.getElementByKey(foundKey) : null;
-      if (el) {
-        el.scrollIntoView({ block: "center", behavior: "smooth" });
-        const rect = el.getBoundingClientRect();
-        recentLinkClickBaton.t = Date.now();
-        onHighlightClick(scrollToLinkId, rect as DOMRect);
-        return;
-      }
-      if (attempts < 15) setTimeout(tick, 40);
-    };
-    const t = setTimeout(tick, 40);
     return () => {
-      cancelled = true;
-      clearTimeout(t);
+      if (linkApiRef) linkApiRef.current = null;
     };
-  }, [editor, scrollToLinkId, scrollNonce, onHighlightClick]);
+  }, [editor, linkApiRef]);
+
+  React.useEffect(() => {
+    if (!onHighlightClick) return;
+    const handler = (e: Event) => {
+      const target = e.target as HTMLElement | null;
+      const el = target?.closest("[data-entity-link]") as HTMLElement | null;
+      if (!el) return;
+      const linkId = el.getAttribute("data-entity-link");
+      if (!linkId) return;
+      recentLinkClickBaton.t = Date.now();
+      onHighlightClick(linkId, el.getBoundingClientRect());
+    };
+    return editor.registerRootListener((rootEl, prevRootEl) => {
+      if (prevRootEl) prevRootEl.removeEventListener("click", handler);
+      if (rootEl) rootEl.addEventListener("click", handler);
+    });
+  }, [editor, onHighlightClick]);
 
   return null;
 };
@@ -1869,10 +1797,9 @@ const StoryEditor: React.FC<StoryEditorProps> = ({
   onSelectionChange,
   onCaretLinkChange,
   entityLinks,
-  getCollectionColor,
   onHighlightClick,
-  scrollToLinkId,
-  scrollNonce,
+  onLinksChange,
+  linkApiRef,
   slashItems,
   onSlashLinkCreate,
   enableSlashLinking = true,
@@ -1885,24 +1812,31 @@ const StoryEditor: React.FC<StoryEditorProps> = ({
       namespace: "StoryEditor",
       theme,
       onError,
-      nodes: [HeadingNode],
+      nodes: [HeadingNode, EntityLinkNode],
     }),
     []
   );
 
   const lastTextRef = React.useRef<string>(value);
   const lastRichRef = React.useRef<string>(richValue ?? "");
+  const lastLinksRef = React.useRef<string>("");
 
   const handleChange = (editorState: EditorState) => {
     editorState.read(() => {
-      const root = $getRoot();
-      const textRaw = root.getTextContent();
-      // Keep canonical newlines so App state + persisted content stay stable.
-      const text = collapseExcessBlankParagraphs(textRaw ?? "");
+      // `text` must come from the same walk that produces link offsets so they align.
+      const { text, links } = collectLinksAndText(docKey);
 
-      if (text === lastTextRef.current) return;
-      lastTextRef.current = text;
-      onChange(text);
+      if (text !== lastTextRef.current) {
+        lastTextRef.current = text;
+        onChange(text);
+      }
+      if (onLinksChange) {
+        const sig = JSON.stringify(links);
+        if (sig !== lastLinksRef.current) {
+          lastLinksRef.current = sig;
+          onLinksChange(links);
+        }
+      }
     });
 
     if (onRichChange) {
@@ -1917,13 +1851,6 @@ const StoryEditor: React.FC<StoryEditorProps> = ({
       }
     }
   };
-
-  const shouldHighlight = !!(
-    entityLinks &&
-    entityLinks.length > 0 &&
-    getCollectionColor &&
-    onHighlightClick
-  );
 
   const effectiveLinks = entityLinks ?? [];
 
@@ -1989,7 +1916,7 @@ const StoryEditor: React.FC<StoryEditorProps> = ({
       </div>
 
       <HistoryPlugin />
-      <SyncExternalValuePlugin docKey={docKey} value={value} richValue={richValue} />
+      <SyncExternalValuePlugin docKey={docKey} value={value} richValue={richValue} lastEmittedRichRef={lastRichRef} />
       <PreventConsecutiveEmptyParagraphsPlugin />
       <OnChangePlugin onChange={handleChange} />
       <SelectionListenerPlugin onSelectionChange={onSelectionChange} />
@@ -2013,25 +1940,9 @@ const StoryEditor: React.FC<StoryEditorProps> = ({
         />
       )}
 
-      {shouldHighlight && (
-        <HighlightLinksPlugin
-          links={entityLinks!}
-          getCollectionColor={getCollectionColor!}
-          onHighlightClick={onHighlightClick!}
-          scrollToLinkId={scrollToLinkId}
-          scrollNonce={scrollNonce}
-        />
-      )}
-
-      {/* If there are no links, we still want the plugin to clear old styles immediately.
-          So when entityLinks is empty we rely on linksSignature change via parent rerender. */}
-      {!shouldHighlight && entityLinks && getCollectionColor && onHighlightClick && (
-        <HighlightLinksPlugin
-          links={entityLinks}
-          getCollectionColor={getCollectionColor}
-          onHighlightClick={onHighlightClick}
-        />
-      )}
+      {/* Links are chips (EntityLinkNode) that style themselves; this plugin wires
+          click-to-open-popover and the host's create/unlink handle. */}
+      <LinkApiPlugin linkApiRef={linkApiRef} onHighlightClick={onHighlightClick} />
     </LexicalComposer>
   );
 };

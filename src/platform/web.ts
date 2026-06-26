@@ -6,6 +6,10 @@ import { createSeedProject, DEFAULT_PROJECT_NAME } from './seedProject';
 const blankProject = () => createSeedProject();
 
 export const webPlatform: Platform = {
+  async openExternal(url: string): Promise<void> {
+    window.open(url, "_blank", "noopener,noreferrer");
+  },
+
   async getUser(): Promise<PlatformUser | null> {
     const { data } = await supabase.auth.getUser();
     if (!data.user) return null;
@@ -104,6 +108,24 @@ export const webPlatform: Platform = {
       .from('projects')
       .update({ name: project.name, data: project, updated_at: new Date().toISOString() })
       .eq('id', rowId);
+  },
+
+  async saveProjectIfUnchanged(
+    rowId: string,
+    project: Project,
+    expectedUpdatedAt: string | null
+  ): Promise<{ ok: boolean; updatedAt: string | null }> {
+    const newTs = new Date().toISOString();
+    let q = supabase
+      .from('projects')
+      .update({ name: project.name, data: project, updated_at: newTs })
+      .eq('id', rowId);
+    // Guard: only write if nobody else has updated the row since our baseline.
+    if (expectedUpdatedAt) q = q.eq('updated_at', expectedUpdatedAt);
+    const { data, error } = await q.select('updated_at');
+    if (error) throw error;
+    const ok = Array.isArray(data) && data.length > 0;
+    return { ok, updatedAt: ok ? (data![0].updated_at as string) : null };
   },
 
   async deleteProject(rowId: string): Promise<void> {
