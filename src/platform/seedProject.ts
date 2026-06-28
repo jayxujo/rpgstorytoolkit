@@ -36,7 +36,10 @@ const richDoc = (children: any[]) =>
 
 // Starter content for a brand-new project (used by both web and the desktop vault),
 // so a fresh project shows off what the toolkit can do instead of being empty.
-export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project {
+export function createSeedProject(
+  name: string = DEFAULT_PROJECT_NAME,
+  experience: "developer" | "storyteller" = "developer",
+): Project {
   const tutorialDocId = crypto.randomUUID();
   const chapterDocId = crypto.randomUUID();
 
@@ -92,13 +95,37 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
     para(txt('Attach images and files to a record, such as a character portrait or a map image. Everything you upload shows up in the Assets panel.')),
 
     heading('h2', 'Timeline'),
-    para(txt('Open Tools, then Timeline, to arrange your documents and record pins across a set of beats. You can rename each section to match your acts, chapters, or quests.')),
+    para(
+      txt('Open Tools, then Timeline. It has two layouts you can toggle. '),
+      txt('Sections', true),
+      txt(' lays out beats left to right (rename each to match your acts, chapters, or quests). '),
+      txt('Line', true),
+      txt(' is a single track where documents become draggable bars and records are pinned as points or spans you can drag and resize.'),
+    ),
 
     heading('h2', 'World Map'),
-    para(txt('Open Tools, then World Map, to create a world, set a map image, and place pins for documents and records directly on the map.')),
+    para(
+      txt('Open Tools, then World Map, to create a world, set a map image, and place pins for documents and records. The map is a canvas you can pan and zoom. Right click a pin to '),
+      txt('draw a region', true),
+      txt(' around it (a colored area you can then drag or reshape), or to delete it.'),
+    ),
+
+    heading('h2', 'Records as pages'),
+    para(
+      txt('Right click any record and choose '),
+      txt('Edit as a page', true),
+      txt(' to open it like a document, with its properties and a rich description you can format and link, plus an assets carousel. Clicking a record on the map or timeline opens it the same way.'),
+    ),
+
+    heading('h2', 'Layouts'),
+    para(
+      txt('Use View, then Change layout, to switch between Focus (one editor at a time) and Dual (two side by side). On the web app, Dual can also show the '),
+      txt('Timeline or World Map on one side', true),
+      txt(' while you write on the other.'),
+    ),
 
     heading('h2', 'Publishing a wiki'),
-    para(txt('On the web app you can publish a clean, read only wiki of your project to share with players or your team.')),
+    para(txt('On the web app you can publish a clean, read only wiki of your project to share with players or your team. Maps in the wiki show their pins and any regions you have drawn.')),
 
     heading('h2', 'Moving your project'),
     para(
@@ -326,10 +353,11 @@ export function createSeedProject(name: string = DEFAULT_PROJECT_NAME): Project 
     timelineLabels: [],
     worldMapDocPins: [],
     worldMapLabelPins: [],
-    // Show the Assets and Dialogue trees in the sidebar by default for new projects.
+    // Developer experience shows the Assets + Conditions trees by default; the
+    // storyteller experience hides both (Assets reveals after the first upload).
     view: {
-      uiShowAssetsTree: true,
-      uiShowDialogueTree: true,
+      uiShowAssetsTree: experience === "developer",
+      uiShowDialogueTree: experience === "developer",
     },
   };
 }

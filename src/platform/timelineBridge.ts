@@ -1,7 +1,7 @@
 // Event bridge between the main window (owner of project state) and the
 // popped-out timeline window (a view + command sender). Desktop-only.
 import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Document, Collection, TimelineLabel } from '../types';
+import type { Document, Collection, TimelineLabel, TimelineLineDoc, TimelineLinePin } from '../types';
 
 export interface TimelineState {
   documents: Document[];
@@ -10,6 +10,9 @@ export interface TimelineState {
   beatCount?: number;
   covers: Record<number, string>;
   sectionTitles?: Record<number, string>;
+  style?: 'section' | 'line';
+  lineDocs?: TimelineLineDoc[];
+  linePins?: TimelineLinePin[];
 }
 
 export type TimelineMutation =
@@ -22,7 +25,15 @@ export type TimelineMutation =
   | { kind: 'uploadCover'; beat: number; fileName: string; base64: string }
   | { kind: 'removeCover'; beat: number }
   | { kind: 'renameSection'; beat: number; title: string }
-  | { kind: 'selectEntity'; collectionId: string; entityId: string };
+  | { kind: 'selectEntity'; collectionId: string; entityId: string }
+  | { kind: 'setStyle'; style: 'section' | 'line' }
+  | { kind: 'addLineDoc'; docId: string; start: number; order?: number }
+  | { kind: 'updateLineDoc'; docId: string; start: number; end?: number }
+  | { kind: 'removeLineDoc'; docId: string }
+  | { kind: 'addLinePin'; collectionId: string; entityId: string; start: number; order?: number }
+  | { kind: 'updateLinePin'; id: string; start: number; end?: number }
+  | { kind: 'removeLinePin'; id: string }
+  | { kind: 'setLineOrder'; itemKind: 'doc' | 'pin'; id: string; order: number };
 
 const STATE_EVENT = 'timeline:state';
 const MUTATION_EVENT = 'timeline:mutation';

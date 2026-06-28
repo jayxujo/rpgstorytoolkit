@@ -31,6 +31,7 @@ import type {
   WorldMapLabelPin,
   WorldMapEntry,
   WorldNameCtx,
+  TimelineLine,
 } from "./types";
 import StoryEditor from "./StoryEditor";
 import Timeline from "./Timeline";
@@ -79,6 +80,7 @@ import type { LinkEditorApi } from "./StoryEditor";
 import {
   migrateDocToChips,
   reconcileDocChips,
+  replaceTextInDoc,
   richContentHasChips,
   isSingleWord,
   type LabelResolver,
@@ -93,6 +95,9 @@ import { buildProjectArchive, readProjectArchive, collectAssetPaths, PROJECT_FIL
 
 const isDesktop = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 import { useAppModal } from "./AppModal";
+import { LanguageSelect, useLang } from "./i18n";
+import { PersonaPrompt } from "./PersonaPrompt";
+import { getPersona, experienceFor, type PersonaId } from "./persona";
 
 /** =========================
  *  Colors / starter data
@@ -152,38 +157,42 @@ const FREE_PROJECT_ASSET_LIMIT = 3;
 
 // Transparency widget (web, free tier): rough monthly running costs + current
 // earnings. Edit these as the real numbers change.
-const MONTHLY_COSTS: { label: string; amount: number; color: string; note?: string }[] = [
-  { label: "Hosting", amount: 20, color: "#4f8cff" },
-  { label: "Database & backend", amount: 25, color: "#22b07d" },
-  { label: "Domain", amount: 2, color: "#b070ff" },
-  // The gap above bare running costs goes to the solo dev who keeps it alive.
-  { label: "For my work and coffee", amount: 33, color: "#e8a33d", note: "Funds ongoing updates, new features, fixes, and yes, my coffee." },
+// Cost breakdown as a share of the monthly break-even goal (percentages, summing
+// to 100). The infra costs take ~80% (in their real proportions); the rest funds
+// the solo dev. Kept as percentages rather than dollars so we don't expose exact
+// figures while still being transparent about where the money goes.
+// `key` maps to i18n labels under `breakEven.cost.<key>` (and `.note` when noted).
+const MONTHLY_COSTS: { key: string; pct: number; color: string; noted?: boolean }[] = [
+  { key: "hosting", pct: 34, color: "#4f8cff" },
+  { key: "backend", pct: 43, color: "#22b07d" },
+  { key: "domain", pct: 3, color: "#b070ff" },
+  { key: "work", pct: 20, color: "#e8a33d", noted: true },
 ];
-const MONTHLY_EARNINGS = 5; // current monthly recurring revenue from Pro subscriptions
+const MONTHLY_EARNINGS_PCT = 6; // how far Pro revenue currently gets us toward break-even
 
 // A small "are we breaking even yet?" bar. The full width is the monthly goal
 // (sum of costs, shown as faded color-coded segments); the fill is current
 // earnings, going red -> green as it approaches the goal.
 const BreakEvenBar: React.FC<{
-  costs: { label: string; amount: number; color: string; note?: string }[];
-  earnings: number;
-}> = ({ costs, earnings }) => {
-  const goal = Math.max(1, costs.reduce((s, c) => s + c.amount, 0));
-  const ratio = Math.max(0, Math.min(1, earnings / goal));
+  costs: { key: string; pct: number; color: string; noted?: boolean }[];
+  earningsPct: number;
+}> = ({ costs, earningsPct }) => {
+  const { t } = useLang();
+  const ratio = Math.max(0, Math.min(1, earningsPct / 100));
   const hue = Math.round(ratio * 120); // 0 = red, 120 = green
   const earnColor = `hsl(${hue}, 90%, 50%)`; // vivid red -> green
 
   return (
     <div style={{ marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid var(--border)" }}>
       <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 4 }}>
-        Help keep RPG Story Toolkit running
+        {t("breakEven.title")}
       </div>
       <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10, lineHeight: 1.45 }}>
-        We keep our costs transparent. Going Pro fills the bar toward our monthly goal.
+        {t("breakEven.subtitle")}
       </div>
 
       {/* Wrapper is not clipped, so the radar rings can spill past the bar */}
-      <div style={{ position: "relative" }} title={`Our earnings: $${earnings}/mo of a $${goal}/mo goal`}>
+      <div style={{ position: "relative" }} title={`${t("breakEven.weAre")} ${earningsPct}% ${t("breakEven.towardBreakEven")}`}>
         <div
           style={{
             position: "relative",
@@ -197,9 +206,9 @@ const BreakEvenBar: React.FC<{
           {/* Cost breakdown: faded, color-coded segments summing to the goal */}
           {costs.map((c) => (
             <div
-              key={c.label}
-              title={`${c.label}: $${c.amount}/mo`}
-              style={{ flexGrow: c.amount, flexBasis: 0, background: c.color, opacity: 0.26 }}
+              key={c.key}
+              title={`${t("breakEven.cost." + c.key)}: ${c.pct}%`}
+              style={{ flexGrow: c.pct, flexBasis: 0, background: c.color, opacity: 0.4 }}
             />
           ))}
           {/* Earnings fill (vivid red -> green) */}
@@ -216,7 +225,7 @@ const BreakEvenBar: React.FC<{
           />
         </div>
         {/* Radar "ping" at the leading edge of current earnings (outside the clip) */}
-        {earnings > 0 && (
+        {earningsPct > 0 && (
           <div
             className="breakEvenPing"
             style={{ left: `${ratio * 100}%`, top: 20, color: earnColor }}
@@ -225,19 +234,19 @@ const BreakEvenBar: React.FC<{
       </div>
 
       <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 11, opacity: 0.85 }}>
-        <span>Our current earnings: <b style={{ color: earnColor }}>${earnings}/mo</b></span>
-        <span>Goal (${goal}/mo)</span>
+        <span>{t("breakEven.reached")} <b style={{ color: earnColor }}>{earningsPct}%</b> {t("breakEven.ofTheWay")}</span>
+        <span>{t("breakEven.goal")}</span>
       </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
         {costs.map((c) => (
           <span
-            key={c.label}
-            title={c.note ?? `${c.label}: $${c.amount}/mo`}
+            key={c.key}
+            title={c.noted ? t("breakEven.cost." + c.key + ".note") : `${t("breakEven.cost." + c.key)}: ${c.pct}%`}
             style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, opacity: 0.9 }}
           >
-            <span style={{ width: 9, height: 9, borderRadius: 2, background: c.color, opacity: 0.55, flexShrink: 0 }} />
-            {c.label} ${c.amount}
+            <span style={{ width: 9, height: 9, borderRadius: 2, background: c.color, opacity: 0.7, flexShrink: 0 }} />
+            {t("breakEven.cost." + c.key)} {c.pct}%
           </span>
         ))}
       </div>
@@ -631,14 +640,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   onRequestSignup,
 }) => {
   const appModal = useAppModal();
+  const { t } = useLang();
 
   // Prompt a guest to make an account, with a button that opens the sign-up screen.
   const promptCreateAccount = (message: string) => {
     void appModal
       .confirm({
-        title: "Create an account",
+        title: t("dlg.createAccountTitle"),
         message,
-        confirmText: "Create account",
+        confirmText: t("profile.createAccount"),
         cancelText: "Not now",
       })
       .then((ok) => {
@@ -667,9 +677,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     current += Object.keys((project.view as any)?.timelineCovers ?? {}).length;
     if (current + incoming <= FREE_PROJECT_ASSET_LIMIT) return true;
     const ok = await appModal.confirm({
-      title: "Pro feature",
+      title: t("dlg.proFeature"),
       message: `The free plan includes up to ${FREE_PROJECT_ASSET_LIMIT} uploaded images per project. Upgrade to Pro for unlimited uploads on the web, or use the desktop app, which is always free and unlimited.`,
-      confirmText: "Upgrade to Pro",
+      confirmText: t("profile.upgradePro"),
       cancelText: "Not now",
     });
     if (ok) goPro();
@@ -821,6 +831,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   // Panel sizes (percentages) — persisted across reloads
   const [panelSizes, setPanelSizes] = useState<number[]>([]);
   const panelGroupRef = useRef<ImperativePanelGroupHandle | null>(null);
+
+  /** ---------- Find & replace across documents ---------- */
+  const [replaceModalOpen, setReplaceModalOpen] = useState(false);
+  const [replaceFind, setReplaceFind] = useState("");
+  const [replaceWith, setReplaceWith] = useState("");
+  const [replaceMatchCase, setReplaceMatchCase] = useState(false);
+  const [replaceScopeAll, setReplaceScopeAll] = useState(true);
+  const [replaceDocIds, setReplaceDocIds] = useState<Id[]>([]);
+  const [replaceBusy, setReplaceBusy] = useState(false);
 
   /** ---------- View menu (Timeline toggle) ---------- */
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
@@ -1009,11 +1028,34 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const [assetModalRowId, setAssetModalRowId] = useState<Id>("");
   // Unified asset/entity actions menu (used by the modal and the sidebar Assets tree)
   const [assetCtxMenu, setAssetCtxMenu] = useState<{ kind: "entity" | "asset"; colId: Id; rowId: Id; assetId?: Id; x: number; y: number } | null>(null);
+  const [rowCtxMenu, setRowCtxMenu] = useState<{ collectionId: Id; rowId: Id; x: number; y: number } | null>(null);
+  // Small image-preview window (with an Edit button to the assets modal).
+  const [assetPreview, setAssetPreview] = useState<{ collectionId: Id; rowId: Id; assetId: Id } | null>(null);
   const [assetUploadMsg, setAssetUploadMsg] = useState<string | null>(null);
   const [showAssetsTree, setShowAssetsTree] = useState(false);
   const [collapsedAssetGroups, setCollapsedAssetGroups] = useState<Record<string, boolean>>({});
   const [showDialogueTree, setShowDialogueTree] = useState(false);
   const [collapsedDialogueGroups, setCollapsedDialogueGroups] = useState<Record<string, boolean>>({});
+
+  // First-run persona prompt: asks what the user builds, then tailors the workspace
+  // (Developer = Conditions + Assets shown; Storyteller = both hidden).
+  const [personaPromptOpen, setPersonaPromptOpen] = useState(false);
+  useEffect(() => {
+    if (!project) return;
+    if (getPersona()) return;
+    if (typeof window !== "undefined" && window.localStorage.getItem("evenstory_persona_asked")) return;
+    setPersonaPromptOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.id]);
+  const handlePersonaDone = (id: PersonaId | null) => {
+    if (typeof window !== "undefined") window.localStorage.setItem("evenstory_persona_asked", "1");
+    setPersonaPromptOpen(false);
+    if (id) {
+      const dev = experienceFor(id) === "developer";
+      setShowAssetsTree(dev);
+      setShowDialogueTree(dev);
+    }
+  };
   const assetUploadInputRef = useRef<HTMLInputElement | null>(null);
   const pendingUploadTargetRef = useRef<{ colId: Id; rowId: Id } | null>(null);
 
@@ -1079,6 +1121,23 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setAssetModalCollectionId(collectionId);
     setAssetModalRowId(rowId);
     setAssetModalOpen(true);
+  };
+
+  // Click an asset (sidebar tree or record page): image → preview window; otherwise
+  // open it in the browser as before.
+  const openAssetPreview = async (collectionId: Id, rowId: Id, assetId: Id) => {
+    const col = project?.collections.find((c) => c.id === collectionId);
+    const row = col?.rows.find((r) => r.id === rowId);
+    const a = row?.assets?.find((x) => x.id === assetId);
+    if (!a) return;
+    if ((a.mime || "").startsWith("image/")) {
+      getSignedAssetUrl(a.path); // warm the cache
+      setAssetPreview({ collectionId, rowId, assetId });
+    } else {
+      const url = await getSignedAssetUrl(a.path);
+      if (!url) { await appModal.alert("Could not open this asset.", { title: "Open failed" }); return; }
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
   };
 
   const addAssetsToEntity = async (collectionId: Id, rowId: Id, files: FileList | null) => {
@@ -1205,12 +1264,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const currentBase = dot >= 0 ? asset.name.slice(0, dot) : asset.name;
 
     const input = await appModal.prompt({
-      title: "Rename asset",
-      message: "Enter a new file name.",
+      title: t("dlg.renameAsset"),
+      message: t("dlg.renameAssetMsg"),
       defaultValue: currentBase,
-      placeholder: "File name",
-      confirmText: "Rename",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phFileName"),
+      confirmText: t("common.rename"),
+      cancelText: t("common.cancel"),
     });
     if (!input) return;
     let base = input.trim();
@@ -1271,12 +1330,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!col || !row) return;
     const current = String(row.values["id"] ?? "");
     const next = await appModal.prompt({
-      title: "Rename record",
-      message: "Enter a new ID for this record.",
+      title: t("dlg.renameRecord"),
+      message: t("dlg.renameRecordMsg"),
       defaultValue: current,
-      placeholder: "Record ID",
-      confirmText: "Rename",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phRecordId"),
+      confirmText: t("common.rename"),
+      cancelText: t("common.cancel"),
     });
     if (!next || next.trim() === current) return;
     updateCollectionCell(collectionId, rowId, "id", next.trim());
@@ -1330,13 +1389,31 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   // shows both side by side. The sidebar is always present.
   const [layoutMode, setLayoutMode] = useState<"focus" | "dual">("focus");
   const [focusView, setFocusView] = useState<"doc" | "collection" | "dataset">("doc");
+  // Dual-view tool side (web only): one Dual side can host the Timeline or World Map.
+  const [dualTool, setDualTool] = useState<"timeline" | "worldmap" | null>(null);
+  const [dualToolSide, setDualToolSide] = useState<"left" | "right">("right");
   const [layoutModalOpen, setLayoutModalOpen] = useState(false);
   const [activeDatasetId, setActiveDatasetId] = useState<Id | null>(null);
+  // When set, the primary editor slot shows a record "as a page" instead of a document.
+  const [recordPage, setRecordPage] = useState<{ collectionId: Id; rowId: Id } | null>(null);
+
+  // Warm signed URLs for every image asset of the open record page (for the carousel).
+  useEffect(() => {
+    if (!recordPage || !project) return;
+    const row = project.collections.find((c) => c.id === recordPage.collectionId)?.rows.find((r) => r.id === recordPage.rowId);
+    for (const a of row?.assets ?? []) {
+      if ((a.mime || "").startsWith("image/") && a.path) getSignedAssetUrl(a.path);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordPage, project]);
   const showLeftPanel = true;
-  const showMiddlePanel = layoutMode === "dual" || focusView === "doc";
+  // When a dual-view tool (timeline/worldmap) occupies one side, the other side behaves
+  // like focus mode (only one editor visible, switchable via the sidebar). Web only.
+  const dualToolActive = layoutMode === "dual" && !!dualTool && !isDesktop;
+  const showMiddlePanel = (layoutMode === "dual" && !dualToolActive) || focusView === "doc";
   // The right panel hosts either the table/database editor or the Dataset view.
   const rightShowsDataset = focusView === "dataset";
-  const showRightPanel = layoutMode === "dual" || focusView === "collection" || focusView === "dataset";
+  const showRightPanel = (layoutMode === "dual" && !dualToolActive) || focusView === "collection" || focusView === "dataset";
 
   // ✅ Timeline overlay height (draggable)
   const defaultTimelineHeight = useMemo(() => {
@@ -1364,6 +1441,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const mode = v.uiLayoutMode === "dual" ? "dual" : "focus";
     setLayoutMode(mode);
     setFocusView(v.uiFocusView === "collection" ? "collection" : v.uiFocusView === "dataset" ? "dataset" : "doc");
+    setDualTool(v.uiDualTool === "timeline" || v.uiDualTool === "worldmap" ? v.uiDualTool : null);
+    setDualToolSide(v.uiDualToolSide === "left" ? "left" : "right");
     setActiveDatasetId(v.activeDatasetId ?? null);
     setShowAssetsTree(v.uiShowAssetsTree === true);
     setShowDialogueTree(v.uiShowDialogueTree === true);
@@ -1401,6 +1480,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       if (
         v.uiLayoutMode === layoutMode &&
         v.uiFocusView === focusView &&
+        (v.uiDualTool ?? null) === (dualTool ?? null) &&
+        (v.uiDualToolSide ?? "right") === dualToolSide &&
         v.uiShowAssetsTree === showAssetsTree &&
         v.uiShowDialogueTree === showDialogueTree &&
         (v.activeDatasetId ?? null) === (activeDatasetId ?? null) &&
@@ -1416,6 +1497,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           ...v,
           uiLayoutMode: layoutMode,
           uiFocusView: focusView,
+          uiDualTool: dualTool,
+          uiDualToolSide: dualToolSide,
           uiShowAssetsTree: showAssetsTree,
           uiShowDialogueTree: showDialogueTree,
           activeDatasetId: activeDatasetId ?? undefined,
@@ -1424,7 +1507,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         },
       };
     });
-  }, [project?.id, layoutMode, focusView, showAssetsTree, showDialogueTree, activeDatasetId, timelineHeight, panelSizes, clampTimelineHeight]);
+  }, [project?.id, layoutMode, focusView, dualTool, dualToolSide, showAssetsTree, showDialogueTree, activeDatasetId, timelineHeight, panelSizes, clampTimelineHeight]);
 
   // ✅ Keep timeline height within the viewport on window resize
   useEffect(() => {
@@ -1647,29 +1730,42 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   /** ---------- Derived ---------- */
   const activeDoc = project?.documents.find((d) => d.id === activeDocId) ?? null;
 
+  // The record currently open "as a page" (null when editing a document).
+  const recordPageCollection = recordPage ? project?.collections.find((c) => c.id === recordPage.collectionId) ?? null : null;
+  const recordPageRow = recordPage ? recordPageCollection?.rows.find((r) => r.id === recordPage.rowId) ?? null : null;
+  const showRecordPage = !!(recordPage && recordPageRow);
+
+  // The active rich-text editing target's links + plain text. Documents and record
+  // descriptions share the same linking machinery, keyed off whichever is open.
+  const activeEditorLinks: EntityLink[] = showRecordPage ? recordPageRow!.descriptionLinks ?? [] : activeDoc?.entityLinks ?? [];
+  const activeEditorContent: string = showRecordPage ? String(recordPageRow!.values["description"] ?? "") : activeDoc?.content ?? "";
+  const hasActiveEditor = showRecordPage || !!activeDoc;
+
   const editingLink =
-    editingLinkId && activeDoc
-      ? activeDoc.entityLinks.find((l) => l.id === editingLinkId) ?? null
+    editingLinkId && hasActiveEditor
+      ? activeEditorLinks.find((l) => l.id === editingLinkId) ?? null
       : null;
 
   const selectedDisplayText =
-    editingLink && activeDoc
-      ? activeDoc.content.slice(editingLink.start, editingLink.end)
+    editingLink
+      ? activeEditorContent.slice(editingLink.start, editingLink.end)
       : linkingSelection?.text ?? "";
 
   // ✅ Disable "Create link" when the current selection overlaps any existing link.
   // (User should click the highlighted link to edit/unlink instead.)
   const selectionOverlapsExistingLink =
-    !!activeDoc &&
+    hasActiveEditor &&
     !!linkingSelection &&
     !editingLinkId &&
-    activeDoc.entityLinks.some(
+    activeEditorLinks.some(
       (l) => !(linkingSelection.end <= l.start || linkingSelection.start >= l.end)
     );
 
   const activeCollection = project?.collections.find((c) => c.id === activeCollectionId) ?? null;
   const timelineEnabled = project?.view?.timelineEnabled ?? false;
   const timelineLabels = project?.timelineLabels ?? [];
+  const timelineStyle = project?.view?.timelineStyle ?? "section";
+  const timelineLine = project?.timelineLine ?? { docs: [], pins: [] };
   const datasets = getDatasets(project);
   const activeDataset = datasets.find((d) => d.id === activeDatasetId) ?? datasets[0] ?? null;
 
@@ -1793,12 +1889,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
   const addDataset = useCallback(async () => {
     const name = await appModal.prompt({
-      title: "New condition",
-      message: "Condition name:",
+      title: t("dlg.newCondition"),
+      message: t("dlg.conditionName"),
       defaultValue: "New condition",
-      placeholder: "Condition name",
-      confirmText: "Create",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phConditionName"),
+      confirmText: t("common.create"),
+      cancelText: t("common.cancel"),
     });
     if (!name || !name.trim()) return;
     const ds: Dataset = {
@@ -1816,11 +1912,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     async (id: Id) => {
       const ds = getDatasets(projectRef.current).find((d) => d.id === id);
       const name = await appModal.prompt({
-        title: "Rename condition",
-        message: "Condition name:",
+        title: t("cond.rename"),
+        message: t("dlg.conditionName"),
         defaultValue: ds?.name ?? "",
-        confirmText: "Rename",
-        cancelText: "Cancel",
+        confirmText: t("common.rename"),
+        cancelText: t("common.cancel"),
       });
       if (!name || !name.trim()) return;
       setProject((prev) =>
@@ -1834,10 +1930,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     async (id: Id) => {
       const ds = getDatasets(projectRef.current).find((d) => d.id === id);
       const ok = await appModal.confirm({
-        title: "Delete condition?",
+        title: t("dlg.deleteConditionQ"),
         message: `Delete "${ds?.name ?? "this condition"}" and all its entries? This can't be undone.`,
-        confirmText: "Delete",
-        cancelText: "Cancel",
+        confirmText: t("common.delete"),
+        cancelText: t("common.cancel"),
         danger: true,
       });
       if (!ok) return;
@@ -1910,6 +2006,18 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           c.id === collectionId
             ? { ...c, assetsEnabled: !(c.assetsEnabled !== false) }
             : c
+        ),
+      };
+    });
+  }, []);
+
+  const toggleCollectionDescriptionEnabled = useCallback((collectionId: Id) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        collections: prev.collections.map((c) =>
+          c.id === collectionId ? { ...c, descriptionEnabled: !(c.descriptionEnabled !== false) } : c
         ),
       };
     });
@@ -2648,6 +2756,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       // ✅ keep view + timeline labels (so beats, enabled/disabled, labels persist)
       view: raw?.view ?? undefined,
       timelineLabels: Array.isArray(raw?.timelineLabels) ? raw.timelineLabels : [],
+      timelineLine: raw?.timelineLine && typeof raw.timelineLine === "object"
+        ? { docs: Array.isArray(raw.timelineLine.docs) ? raw.timelineLine.docs : [], pins: Array.isArray(raw.timelineLine.pins) ? raw.timelineLine.pins : [] }
+        : undefined,
 
       // ✅ keep explicit (empty) folders and world-map pins across reloads
       documentFolders: Array.isArray(raw?.documentFolders) ? raw.documentFolders : [],
@@ -2706,6 +2817,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         migratedFolderPath = parsed.folderPath;
         migratedName = parsed.name || migratedName;
       }
+      // Every record has a Description (the rich "edit as a page" body). Ensure the
+      // field exists in the schema so old projects gain it.
+      let schema: CollectionField[] = Array.isArray(c?.schema) ? c.schema : [];
+      if (!schema.some((f: CollectionField) => f.id === "description")) {
+        schema = [...schema, { id: "description", label: "Description", type: "text" }];
+      }
       return {
         id: String(c?.id ?? `col_${Date.now()}`),
         name: migratedName,
@@ -2713,8 +2830,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         color: String(c?.color ?? getDefaultColor(0)),
         kind: (c?.kind === "characters" ? "characters" : "generic") as "characters" | "generic",
         assetsEnabled: c?.assetsEnabled !== false,
-        schema: Array.isArray(c?.schema) ? c.schema : [],
-        rows: Array.isArray(c?.rows) ? c.rows : [],
+        descriptionEnabled: c?.descriptionEnabled !== false,
+        schema,
+        rows: (Array.isArray(c?.rows) ? c.rows : []).map((r: any) => ({
+          ...r,
+          values: { description: "", ...(r?.values ?? {}) },
+        })),
       };
     });
 
@@ -2902,6 +3023,31 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       })
       .filter(Boolean) as any;
 
+    // Scrub orphans: drop any map pins / timeline references whose doc or record no
+    // longer exists (e.g. deleted in an older build before delete-cleanup existed),
+    // so the UI never shows a stale pin with a raw id or an empty marker.
+    {
+      const docIds = new Set((p.documents ?? []).map((d: any) => String(d.id)));
+      const recKeys = new Set<string>();
+      for (const c of p.collections ?? []) for (const r of (c.rows ?? [])) recKeys.add(`${c.id}:${r.id}`);
+      const recOk = (x: any) => recKeys.has(`${x?.collectionId}:${x?.entityId}`);
+
+      p.worldMapDocPins = (p.worldMapDocPins ?? []).filter((pin: any) => docIds.has(String(pin.docId)));
+      p.worldMapLabelPins = (p.worldMapLabelPins ?? []).filter((pin: any) => recOk(pin));
+      p.worldMaps = (p.worldMaps ?? []).map((m: any) => ({
+        ...m,
+        docPins: (m.docPins ?? []).filter((pin: any) => docIds.has(String(pin.docId))),
+        labelPins: (m.labelPins ?? []).filter((pin: any) => recOk(pin)),
+      }));
+      p.timelineLabels = (p.timelineLabels ?? []).filter((l: any) => recOk(l));
+      if (p.timelineLine) {
+        p.timelineLine = {
+          docs: (p.timelineLine.docs ?? []).filter((ld: any) => docIds.has(String(ld.docId))),
+          pins: (p.timelineLine.pins ?? []).filter((pin: any) => recOk(pin)),
+        };
+      }
+    }
+
     return p;
   };
 
@@ -3003,9 +3149,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     }
     if (!profile?.is_pro) {
       const ok = await appModal.confirm({
-        title: "Pro feature",
-        message: "Multiple projects are part of Pro. Upgrade to create and manage more than one project on the web.",
-        confirmText: "Upgrade to Pro",
+        title: t("dlg.proFeature"),
+        message: t("dlg.multiProjectPro"),
+        confirmText: t("profile.upgradePro"),
         cancelText: "Not now",
       });
       if (ok) goPro();
@@ -3076,15 +3222,20 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   useEffect(() => {
     if (!isDesktop) return;
     const uid = syncSession?.user?.id;
-    if (!uid) { setSyncIsPro(false); return; }
+    if (!uid) { setSyncIsPro(false); setAvatarUrl(null); return; }
     let cancelled = false;
     const refresh = () => {
       supabase
         .from("profiles")
-        .select("is_pro")
+        .select("is_pro, avatar_path")
         .eq("id", uid)
         .maybeSingle()
-        .then(({ data }) => { if (!cancelled) setSyncIsPro(!!data?.is_pro); });
+        .then(({ data }) => {
+          if (cancelled) return;
+          setSyncIsPro(!!data?.is_pro);
+          // Show the account's profile picture (from the web "avatars" bucket).
+          refreshAvatarSignedUrl((data as { avatar_path?: string | null } | null)?.avatar_path ?? null);
+        });
     };
     refresh();
     window.addEventListener("focus", refresh);
@@ -3129,9 +3280,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!syncIsPro) {
       void appModal
         .confirm({
-          title: "Pro required",
-          message: "Syncing between desktop and web is a Pro feature. Upgrade to Pro to enable it. We'll open the upgrade page in your browser.",
-          confirmText: "Upgrade to Pro",
+          title: t("dlg.proRequired"),
+          message: t("dlg.syncPro"),
+          confirmText: t("profile.upgradePro"),
           cancelText: "Not now",
         })
         .then((ok) => {
@@ -3430,10 +3581,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!requireSyncPro()) return;
     if (syncSession!.user.id !== syncMeta.accountId) {
       const relink = await appModal.confirm({
-        title: "Different account",
-        message: "This project is linked to a different web account. Create a copy on your current account and sync to that instead? (The original link is replaced.)",
-        confirmText: "Sync to this account",
-        cancelText: "Cancel",
+        title: t("dlg.differentAccount"),
+        message: t("dlg.differentAccountMsg"),
+        confirmText: t("dlg.syncToThisAccount"),
+        cancelText: t("common.cancel"),
       });
       if (relink) await syncExistingToWeb({ skipConfirm: true });
       return;
@@ -3453,12 +3604,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const pullOpt = { value: "pull", label: "Pull: web → this device (overwrite local)" };
     const pushOpt = { value: "push", label: "Push: this device → web (overwrite web)" };
     const choice = await appModal.select({
-      title: "Sync project",
+      title: t("dlg.syncProject"),
       message: `Web copy last updated: ${webUpdated}\nThis device: ${localInfo}\n\nChoose a direction. The other side will be overwritten.`,
       // When the web copy is newer, default to pulling it down.
       options: webHasNewer ? [pullOpt, pushOpt] : [pushOpt, pullOpt],
       defaultValue: webHasNewer ? "pull" : "push",
-      confirmText: "Sync",
+      confirmText: t("dlg.sync"),
     });
     if (!choice) return;
 
@@ -3493,10 +3644,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const uid = syncSession!.user.id;
     if (!opts?.skipConfirm) {
       const ok = await appModal.confirm({
-        title: "Sync to web",
-        message: "This creates a copy of this project on your web account and links them so you can sync. Continue?",
-        confirmText: "Sync to web",
-        cancelText: "Cancel",
+        title: t("dlg.syncToWeb"),
+        message: t("dlg.syncToWebMsg"),
+        confirmText: t("dlg.syncToWeb"),
+        cancelText: t("common.cancel"),
       });
       if (!ok) return;
     }
@@ -3733,7 +3884,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         // Stay on the launcher and explain instead of bailing to an error screen.
         appModal.alert(
           "That folder isn't a project. Pick a folder that already contains a project, or use Create new project to start one.",
-          { title: "Not a project" }
+          { title: t("dlg.notAProject") }
         );
         return;
       }
@@ -3756,10 +3907,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setFileMenuOpen(false);
     if (isDirty) {
       const ok = await appModal.confirm({
-        title: "Unsaved changes",
-        message: "You have unsaved changes. Save before creating a new project?",
-        confirmText: "Save & Create",
-        cancelText: "Create without saving",
+        title: t("dlg.unsavedChanges"),
+        message: t("dlg.unsavedCreateMsg"),
+        confirmText: t("dlg.saveCreate"),
+        cancelText: t("dlg.createWithoutSaving"),
       });
       if (ok) await saveProjectToSupabase();
     }
@@ -3783,10 +3934,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setFileMenuOpen(false);
     if (isDirty) {
       const ok = await appModal.confirm({
-        title: "Unsaved changes",
-        message: "You have unsaved changes. Save before switching project?",
-        confirmText: "Save & Continue",
-        cancelText: "Continue without saving",
+        title: t("dlg.unsavedChanges"),
+        message: t("dlg.unsavedSwitchMsg"),
+        confirmText: t("dlg.saveContinue"),
+        cancelText: t("dlg.continueWithoutSaving"),
       });
       if (ok) await saveProjectToSupabase();
     }
@@ -3836,7 +3987,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       if (missing.length) {
         await appModal.alert(
           `Project exported. ${missing.length} asset file(s) could not be found and were skipped.`,
-          { title: "Export complete" }
+          { title: t("dlg.exportComplete") }
         );
       }
     } catch (e: any) {
@@ -3936,10 +4087,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         // Desktop: import lands in a brand-new vault the user chooses.
         if (isDirty) {
           const ok = await appModal.confirm({
-            title: "Unsaved changes",
-            message: "Importing opens a different project. Save your current changes first?",
-            confirmText: "Save first",
-            cancelText: "Discard",
+            title: t("dlg.unsavedChanges"),
+            message: t("dlg.unsavedImportMsg"),
+            confirmText: t("dlg.saveFirst"),
+            cancelText: t("dlg.discard"),
           });
           if (ok) await saveProjectToSupabase();
         }
@@ -3958,11 +4109,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       } else {
         // Web is single-project: importing replaces the current project.
         const ok = await appModal.confirm({
-          title: "Replace current project?",
+          title: t("dlg.replaceProject"),
           message:
             "Importing will replace your current project with the imported one. This can't be undone.",
-          confirmText: "Replace",
-          cancelText: "Cancel",
+          confirmText: t("replace.replace"),
+          cancelText: t("common.cancel"),
         });
         if (!ok) return;
         setLoadingInit(true);
@@ -4195,13 +4346,13 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       const stillDirty = !!current && JSON.stringify(current) !== savedJson;
       setIsDirty(stillDirty);
 
-      setSaveMessage("Saved.");
+      setSaveMessage(t("status.saved"));
       setTimeout(() => setSaveMessage(null), 2000);
 
       // Desktop Pro: quietly push to the linked web project shortly after saving.
       if (isDesktop) scheduleAutoSync();
     } catch (e: any) {
-      setSaveMessage(`Save failed: ${e?.message ?? "Unknown error"}`);
+      setSaveMessage(`${t("status.saveFailed")}: ${e?.message ?? t("status.unknownError")}`);
     } finally {
       setSaving(false);
     }
@@ -4321,6 +4472,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             id: r.id, // internal id (not rendered publicly)
             values,
             cover, // only cover image is preserved
+            // Rich Description body (rendered document-style on the record page).
+            descriptionRich: c.descriptionEnabled !== false ? r.descriptionRich ?? "" : "",
+            descriptionLinks: c.descriptionEnabled !== false ? r.descriptionLinks ?? [] : [],
           };
         });
 
@@ -4330,7 +4484,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           kind: c.kind,
           color: c.color,
           folderPath: c.folderPath ?? [],
-          schema: (c.schema ?? []).filter((f) => f.id !== "id"),
+          // Hide the Description from the field list (it renders as the page body instead).
+          schema: (c.schema ?? []).filter((f) => f.id !== "id" && f.id !== "description"),
+          descriptionEnabled: c.descriptionEnabled !== false,
           rows,
         };
       });
@@ -4486,8 +4642,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const slug = w?.slug && w.slug.trim().length ? w.slug : slugFromProjectName(project.name);
 
     // Defaults if user hasn’t set SEO yet
-    const defaultTitle = project.name || "Story Wiki";
-    const defaultDescription = "Public wiki for this story project.";
+    const defaultTitle = project.name || t("wiki.defaultTitle");
+    const defaultDescription = t("wiki.defaultDesc");
 
     setWikiDraftDocIds(docIds);
     setWikiDraftColIds(colIds);
@@ -5103,12 +5259,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const current = doc?.title ?? "";
 
     const title = await appModal.prompt({
-      title: "Rename document",
-      message: "Enter a new document name.",
+      title: t("dlg.renameDocument"),
+      message: t("dlg.renameDocMsg"),
       defaultValue: current,
-      placeholder: "Document name",
-      confirmText: "Rename",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phDocumentName"),
+      confirmText: t("common.rename"),
+      cancelText: t("common.cancel"),
     });
 
     if (!title) return;
@@ -5142,10 +5298,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!project) return;
 
     const ok = await appModal.confirm({
-      title: "Delete document?",
-      message: "Delete this document? This cannot be undone.",
-      confirmText: "Delete",
-      cancelText: "Cancel",
+      title: t("dlg.deleteDocument"),
+      message: t("dlg.deleteDocMsg"),
+      confirmText: t("common.delete"),
+      cancelText: t("common.cancel"),
       danger: true,
     });
     if (!ok) return;
@@ -5170,7 +5326,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     setProject((prev) => {
       if (!prev) return prev;
       const docs = prev.documents.filter((d) => d.id !== id);
-      return { ...prev, documents: docs };
+      // Drop any references to the deleted doc from the map + line timeline so no
+      // orphan pin/bar (showing a raw id or empty) is left behind.
+      const worldMapDocPins = (prev.worldMapDocPins ?? []).filter((p) => p.docId !== id);
+      const worldMaps = (prev.worldMaps ?? []).map((m) => ({ ...m, docPins: (m.docPins ?? []).filter((p) => p.docId !== id) }));
+      const timelineLine = prev.timelineLine
+        ? { ...prev.timelineLine, docs: (prev.timelineLine.docs ?? []).filter((ld) => ld.docId !== id) }
+        : prev.timelineLine;
+      return { ...prev, documents: docs, worldMapDocPins, worldMaps, timelineLine };
     });
 
     if (activeDocId === id) {
@@ -5190,12 +5353,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!project) return;
 
     const name = await appModal.prompt({
-      title: "New table",
-      message: "Table name (e.g. Items, Locations):",
+      title: t("dlg.newTable"),
+      message: t("dlg.newTableMsg"),
       defaultValue: `Table ${project.collections.length + 1}`,
-      placeholder: "Table name",
-      confirmText: "Create",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phTableName"),
+      confirmText: t("common.create"),
+      cancelText: t("common.cancel"),
     });
     if (!name) return;
 
@@ -5237,12 +5400,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const current = col?.name ?? "";
 
     const name = await appModal.prompt({
-      title: "Rename table",
-      message: "Enter a new table name.",
+      title: t("dlg.renameTable"),
+      message: t("dlg.renameTableMsg"),
       defaultValue: current,
-      placeholder: "Table name",
-      confirmText: "Rename",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phTableName"),
+      confirmText: t("common.rename"),
+      cancelText: t("common.cancel"),
     });
 
     if (!name) return;
@@ -5289,10 +5452,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!project) return;
 
     const ok = await appModal.confirm({
-      title: "Delete table?",
-      message: "Delete this table and unlink all links to it? This cannot be undone.",
-      confirmText: "Delete",
-      cancelText: "Cancel",
+      title: t("dlg.deleteTable"),
+      message: t("dlg.deleteTableMsg"),
+      confirmText: t("common.delete"),
+      cancelText: t("common.cancel"),
       danger: true,
     });
     if (!ok) return;
@@ -5329,7 +5492,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       // Scrub dataset references to the deleted collection.
       const datasets = scrubDatasetRefs(prev.datasets, { collectionId: id });
 
-      return { ...prev, collections, documents, datasets };
+      // Remove all of this table's records from the map + timeline.
+      const worldMapLabelPins = (prev.worldMapLabelPins ?? []).filter((p) => p.collectionId !== id);
+      const worldMaps = (prev.worldMaps ?? []).map((m) => ({ ...m, labelPins: (m.labelPins ?? []).filter((p) => p.collectionId !== id) }));
+      const timelineLabels = (prev.timelineLabels ?? []).filter((l) => l.collectionId !== id);
+      const timelineLine = prev.timelineLine
+        ? { ...prev.timelineLine, pins: (prev.timelineLine.pins ?? []).filter((p) => p.collectionId !== id) }
+        : prev.timelineLine;
+
+      return { ...prev, collections, documents, datasets, worldMapLabelPins, worldMaps, timelineLabels, timelineLine };
     });
 
     if (activeCollectionId === id) {
@@ -5378,11 +5549,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
   const addFolder = async (kind: "doc" | "col", parentPath: string[]) => {
     const name = await appModal.prompt({
-      title: "New folder",
-      message: "Folder name:",
-      placeholder: "Folder name",
-      confirmText: "Create",
-      cancelText: "Cancel",
+      title: t("dlg.newFolder"),
+      message: t("dlg.folderName"),
+      placeholder: t("dlg.phFolderName"),
+      confirmText: t("common.create"),
+      cancelText: t("common.cancel"),
     });
     if (!name) return;
     const clean = cleanFolderName(name);
@@ -5423,12 +5594,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const renameFolder = async (kind: "doc" | "col", path: string[]) => {
     const current = path[path.length - 1];
     const name = await appModal.prompt({
-      title: "Rename folder",
-      message: "Enter a new folder name.",
+      title: t("dlg.renameFolder"),
+      message: t("dlg.renameFolderMsg"),
       defaultValue: current,
-      placeholder: "Folder name",
-      confirmText: "Rename",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phFolderName"),
+      confirmText: t("common.rename"),
+      cancelText: t("common.cancel"),
     });
     if (!name) return;
     const clean = cleanFolderName(name);
@@ -5458,10 +5629,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
   const deleteFolder = async (kind: "doc" | "col", path: string[]) => {
     const ok = await appModal.confirm({
-      title: "Delete folder?",
+      title: t("dlg.deleteFolder"),
       message: `Delete "${path[path.length - 1]}" and everything inside it? This cannot be undone.`,
-      confirmText: "Delete",
-      cancelText: "Cancel",
+      confirmText: t("common.delete"),
+      cancelText: t("common.cancel"),
       danger: true,
     });
     if (!ok || !project) return;
@@ -5754,13 +5925,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       // chip that points at it across ALL documents (open or not). Unlinked text and
       // `text`-mode chips are untouched.
       let documents = prev.documents;
+      let collectionsOut = collections;
       if (fieldId === "name" || fieldId === "id") {
         const labelOf: LabelResolver = (cid, eid) => {
-          const col = collections.find((c) => c.id === cid);
+          const col = collectionsOut.find((c) => c.id === cid);
           const row = col?.rows.find((r) => r.id === eid);
           return row ? String(row.values["name"] || row.values["id"] || row.id) : null;
         };
-        const colorOf = (cid: string) => collections.find((c) => c.id === cid)?.color;
+        const colorOf = (cid: string) => collectionsOut.find((c) => c.id === cid)?.color;
         documents = prev.documents.map((d) => {
           try {
             const res = reconcileDocChips(d, labelOf, colorOf);
@@ -5769,9 +5941,28 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             return d;
           }
         });
+        // Record descriptions can hold chips too — reconcile them like mini-documents.
+        collectionsOut = collectionsOut.map((c) => ({
+          ...c,
+          rows: c.rows.map((r) => {
+            if (!richContentHasChips(r.descriptionRich)) return r;
+            try {
+              const res = reconcileDocChips(
+                { id: r.id, content: String(r.values["description"] ?? ""), richContent: r.descriptionRich, entityLinks: r.descriptionLinks ?? [] } as any,
+                labelOf,
+                colorOf
+              );
+              return res
+                ? { ...r, descriptionRich: res.richContent, descriptionLinks: res.entityLinks, values: { ...r.values, description: res.content } }
+                : r;
+            } catch {
+              return r;
+            }
+          }),
+        }));
       }
 
-      return { ...prev, collections, documents };
+      return { ...prev, collections: collectionsOut, documents };
     });
 
     // Trigger immediate folder rename on desktop
@@ -5790,12 +5981,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!col) return;
 
     const label = await appModal.prompt({
-      title: "New column",
-      message: "New column name:",
+      title: t("dlg.newColumn"),
+      message: t("dlg.newColumnMsg"),
       defaultValue: "New field",
-      placeholder: "Column name",
-      confirmText: "Next",
-      cancelText: "Cancel",
+      placeholder: t("dlg.phColumnName"),
+      confirmText: t("dlg.next"),
+      cancelText: t("common.cancel"),
     });
     if (!label) return;
 
@@ -5816,11 +6007,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     }
 
     const typeInput = await appModal.select({
-      title: "Field type",
-      message: "Choose how this column should behave.",
+      title: t("dlg.fieldType"),
+      message: t("dlg.fieldTypeMsg"),
       defaultValue: "string",
-      confirmText: "Add column",
-      cancelText: "Cancel",
+      confirmText: t("dlg.addColumn"),
+      cancelText: t("common.cancel"),
       options: [
         { value: "string", label: "String (short text)" },
         { value: "number", label: "Number (numeric value)" },
@@ -5860,12 +6051,16 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       appModal.alert("The 'id' and 'name' columns are required and cannot be deleted.", { title: "Cannot delete" });
       return;
     }
+    if (fieldId === "description") {
+      appModal.alert("The Description is a built-in field. You can hide it from this table instead of deleting it.", { title: "Cannot delete" });
+      return;
+    }
 
     const ok = await appModal.confirm({
-      title: "Delete column?",
-      message: "Delete this column from the table?",
-      confirmText: "Delete",
-      cancelText: "Cancel",
+      title: t("dlg.deleteColumn"),
+      message: t("dlg.deleteColumnMsg"),
+      confirmText: t("common.delete"),
+      cancelText: t("common.cancel"),
       danger: true,
     });
     if (!ok) return;
@@ -5963,13 +6158,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (!project) return;
 
     const ok = await appModal.confirm({
-      title: "Delete row?",
-      message: "Delete this row and unlink all links to it?",
-      confirmText: "Delete",
-      cancelText: "Cancel",
+      title: t("dlg.deleteRow"),
+      message: t("dlg.deleteRowMsg"),
+      confirmText: t("common.delete"),
+      cancelText: t("common.cancel"),
       danger: true,
     });
     if (!ok) return;
+
+    if (recordPage && recordPage.collectionId === collectionId && recordPage.rowId === rowId) {
+      setRecordPage(null);
+    }
 
     const rowCol = project.collections.find((c) => c.id === collectionId);
     const delRow = rowCol?.rows.find((r) => r.id === rowId);
@@ -5990,7 +6189,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
       const datasets = scrubDatasetRefs(prev.datasets, { collectionId, rowId });
 
-      return { ...prev, collections, documents, datasets };
+      // Drop the deleted record from the map (label pins) + timeline (section labels +
+      // line pins) so no orphan pin/label (showing a raw id or empty) is left behind.
+      const matches = (p: { collectionId: Id; entityId: Id }) => p.collectionId === collectionId && p.entityId === rowId;
+      const worldMapLabelPins = (prev.worldMapLabelPins ?? []).filter((p) => !matches(p));
+      const worldMaps = (prev.worldMaps ?? []).map((m) => ({ ...m, labelPins: (m.labelPins ?? []).filter((p) => !matches(p)) }));
+      const timelineLabels = (prev.timelineLabels ?? []).filter((l) => !matches(l));
+      const timelineLine = prev.timelineLine
+        ? { ...prev.timelineLine, pins: (prev.timelineLine.pins ?? []).filter((p) => !matches(p)) }
+        : prev.timelineLine;
+
+      return { ...prev, collections, documents, datasets, worldMapLabelPins, worldMaps, timelineLabels, timelineLine };
     });
 
     if (isDesktop && rowCol && rowKey) {
@@ -6060,6 +6269,74 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       if ((prev.view?.timelineEnabled ?? false) === visible) return prev;
       return { ...prev, view: { ...(prev.view ?? {}), timelineEnabled: visible } };
     });
+  };
+
+  // ── Timeline style (section vs line) + line-style (Gantt) data ──────────────
+  const setTimelineStyle = (style: "section" | "line") => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      if ((prev.view?.timelineStyle ?? "section") === style) return prev;
+      return { ...prev, view: { ...(prev.view ?? {}), timelineStyle: style } };
+    });
+  };
+
+  const clamp01 = (n: number) => Math.max(0, Math.min(100, n));
+  const mutateTimelineLine = (fn: (line: TimelineLine) => TimelineLine) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      const line = prev.timelineLine ?? { docs: [], pins: [] };
+      return { ...prev, timelineLine: fn({ docs: line.docs ?? [], pins: line.pins ?? [] }) };
+    });
+  };
+
+  const addTimelineLineDoc = (docId: Id, start = 50, order?: number) => {
+    mutateTimelineLine((line) => {
+      if (line.docs.some((d) => d.docId === docId)) return line;
+      // Placed as a pin at the clicked position + lane; right-click can turn it into a range.
+      return { ...line, docs: [...line.docs, { docId, start: clamp01(start), order }] };
+    });
+  };
+  const updateTimelineLineDoc = (docId: Id, start: number, end?: number) => {
+    mutateTimelineLine((line) => ({
+      ...line,
+      docs: line.docs.map((d) => {
+        if (d.docId !== docId) return d;
+        if (end == null) return { ...d, start: clamp01(start), end: undefined };
+        const s = clamp01(Math.min(start, end));
+        const e = clamp01(Math.max(start, end));
+        return { ...d, start: s, end: e };
+      }),
+    }));
+  };
+  const removeTimelineLineDoc = (docId: Id) => {
+    mutateTimelineLine((line) => ({ ...line, docs: line.docs.filter((d) => d.docId !== docId) }));
+  };
+  const addTimelineLinePin = (collectionId: Id, entityId: Id, start = 50, order?: number) => {
+    mutateTimelineLine((line) => ({
+      ...line,
+      // Placed as a pin at the clicked position + lane; right-click can turn it into a range.
+      pins: [...line.pins, { id: crypto.randomUUID(), collectionId, entityId, start: clamp01(start), order }],
+    }));
+  };
+  const setTimelineLineOrder = (kind: "doc" | "pin", id: Id, order: number) => {
+    mutateTimelineLine((line) => kind === "doc"
+      ? { ...line, docs: line.docs.map((d) => (d.docId === id ? { ...d, order } : d)) }
+      : { ...line, pins: line.pins.map((p) => (p.id === id ? { ...p, order } : p)) });
+  };
+  const updateTimelineLinePin = (id: Id, start: number, end?: number) => {
+    mutateTimelineLine((line) => ({
+      ...line,
+      pins: line.pins.map((p) => {
+        if (p.id !== id) return p;
+        if (end == null) return { ...p, start: clamp01(start), end: undefined };
+        const s = clamp01(Math.min(start, end));
+        const e = clamp01(Math.max(start, end));
+        return { ...p, start: s, end: e };
+      }),
+    }));
+  };
+  const removeTimelineLinePin = (id: Id) => {
+    mutateTimelineLine((line) => ({ ...line, pins: line.pins.filter((p) => p.id !== id) }));
   };
 
   const moveDocOnTimeline = (docId: Id, position: number) => {
@@ -6397,6 +6674,18 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     });
   };
 
+  const setWorldMapDocPinBorder = (pinId: Id, border: { x: number; y: number }[] | null) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        worldMapDocPins: (prev.worldMapDocPins ?? []).map((p) =>
+          p.id === pinId ? { ...p, border: border && border.length >= 3 ? border : undefined } : p
+        ),
+      };
+    });
+  };
+
   const addWorldMapLabelPin = (collectionId: Id, entityId: Id, x: number, y: number) => {
     setProject((prev) => {
       if (!prev) return prev;
@@ -6412,6 +6701,18 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         ...prev,
         worldMapLabelPins: (prev.worldMapLabelPins ?? []).map((p) =>
           p.id === pinId ? { ...p, x, y } : p
+        ),
+      };
+    });
+  };
+
+  const setWorldMapLabelPinBorder = (pinId: Id, border: { x: number; y: number }[] | null) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        worldMapLabelPins: (prev.worldMapLabelPins ?? []).map((p) =>
+          p.id === pinId ? { ...p, border: border && border.length >= 3 ? border : undefined } : p
         ),
       };
     });
@@ -6539,6 +6840,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       beatCount: timelineBeatCount,
       covers: timelineCoverUrls,
       sectionTitles: project?.view?.timelineSectionTitles ?? {},
+      style: timelineStyle,
+      lineDocs: timelineLine.docs,
+      linePins: timelineLine.pins,
     }),
     handlers: {
       insertBeat: (beat: number) => insertBeatAfter(beat),
@@ -6557,6 +6861,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       removeCover: (beat: number) => removeTimelineCover(beat),
       renameSection: (beat: number, title: string) => renameTimelineSection(beat, title),
       selectEntity: (collectionId: Id, entityId: Id) => openEntityInCollection(collectionId, entityId),
+      setStyle: (s: "section" | "line") => setTimelineStyle(s),
+      addLineDoc: (docId: Id, start: number, order?: number) => addTimelineLineDoc(docId, start, order),
+      updateLineDoc: (docId: Id, start: number, end?: number) => updateTimelineLineDoc(docId, start, end),
+      removeLineDoc: (docId: Id) => removeTimelineLineDoc(docId),
+      addLinePin: (collectionId: Id, entityId: Id, start: number, order?: number) => addTimelineLinePin(collectionId, entityId, start, order),
+      updateLinePin: (id: Id, start: number, end?: number) => updateTimelineLinePin(id, start, end),
+      removeLinePin: (id: Id) => removeTimelineLinePin(id),
+      setLineOrder: (kind: "doc" | "pin", id: Id, order: number) => setTimelineLineOrder(kind, id, order),
     },
   };
 
@@ -6581,6 +6893,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           case "removeCover": h.removeCover(m.beat); break;
           case "renameSection": h.renameSection(m.beat, m.title); break;
           case "selectEntity": h.selectEntity(m.collectionId, m.entityId); break;
+          case "setStyle": h.setStyle(m.style); break;
+          case "addLineDoc": h.addLineDoc(m.docId, m.start, m.order); break;
+          case "updateLineDoc": h.updateLineDoc(m.docId, m.start, m.end); break;
+          case "removeLineDoc": h.removeLineDoc(m.docId); break;
+          case "addLinePin": h.addLinePin(m.collectionId, m.entityId, m.start, m.order); break;
+          case "updateLinePin": h.updateLinePin(m.id, m.start, m.end); break;
+          case "removeLinePin": h.removeLinePin(m.id); break;
+          case "setLineOrder": h.setLineOrder(m.itemKind, m.id, m.order); break;
         }
       });
       if (cancelled) { fnMut(); } else { unlistenMut = fnMut; }
@@ -6597,7 +6917,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   useEffect(() => {
     if (!isDesktop) return;
     emitTimelineState(timelineBridgeRef.current.state());
-  }, [project?.documents, project?.collections, timelineLabels, timelineBeatCount, timelineCoverUrls, project?.view?.timelineSectionTitles]);
+  }, [project?.documents, project?.collections, timelineLabels, timelineBeatCount, timelineCoverUrls, project?.view?.timelineSectionTitles, timelineStyle, project?.timelineLine]);
 
   /** =========================
    *  World map window bridge (desktop only)
@@ -6649,7 +6969,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       addLabelPin: (collectionId: Id, entityId: Id, x: number, y: number) => addWorldMapLabelPin(collectionId, entityId, x, y),
       moveLabelPin: (pinId: Id, x: number, y: number) => updateWorldMapLabelPinPos(pinId, x, y),
       removeLabelPin: (pinId: Id) => removeWorldMapLabelPin(pinId),
+      setDocPinBorder: (pinId: Id, border: { x: number; y: number }[] | null) => setWorldMapDocPinBorder(pinId, border),
+      setLabelPinBorder: (pinId: Id, border: { x: number; y: number }[] | null) => setWorldMapLabelPinBorder(pinId, border),
       openDoc: (docId: Id) => setActiveDocId(docId),
+      openRecord: (collectionId: Id, entityId: Id) => openRecordPage(collectionId, entityId),
       save: () => saveProjectToSupabase(),
     },
   };
@@ -6684,7 +7007,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           case "addLabelPin": h.addLabelPin(m.collectionId, m.entityId, m.x, m.y); break;
           case "moveLabelPin": h.moveLabelPin(m.pinId, m.x, m.y); break;
           case "removeLabelPin": h.removeLabelPin(m.pinId); break;
+          case "setDocPinBorder": h.setDocPinBorder(m.pinId, m.border); break;
+          case "setLabelPinBorder": h.setLabelPinBorder(m.pinId, m.border); break;
           case "openDoc": h.openDoc(m.docId); break;
+          case "openRecord": h.openRecord(m.collectionId, m.entityId); break;
           case "save": h.save(); break;
         }
       });
@@ -6853,9 +7179,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
    *  ========================= */
   const handleHighlightClick = useCallback(
     (linkId: Id, anchorRect: DOMRect) => {
-      if (!project || !activeDoc) return;
+      if (!project || !hasActiveEditor) return;
 
-      const link = activeDoc.entityLinks.find((l) => l.id === linkId);
+      const link = activeEditorLinks.find((l) => l.id === linkId);
       if (!link) return;
 
       // Reflect the link target in the table panel, but DON'T switch focus away from the
@@ -6873,7 +7199,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         }, 50);
       }
 
-      const text = activeDoc.content.slice(link.start, link.end);
+      const text = activeEditorContent.slice(link.start, link.end);
 
       setLinkingSelection({ start: link.start, end: link.end, text });
       setLinkingCollectionId(link.collectionId);
@@ -6891,7 +7217,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       });
 
     },
-    [project, activeDoc, layoutMode, focusView]
+    [project, activeDoc, showRecordPage, recordPageRow, layoutMode, focusView]
   );
 
   // Keeps the link popover from disappearing when you click its controls (which can collapse editor selection).
@@ -6968,7 +7294,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   }, [linkingSelection, editingLink, linkPopoverAnchorRect, closeLinkEditor]);
 
   const handleEditorSelectionChange = (range: { start: number; end: number; text: string; anchorRect: AnchorRect | null } | null) => {
-    if (!project || !activeDoc) {
+    if (!project || !hasActiveEditor) {
       closeLinkEditor();
       return;
     }
@@ -6986,7 +7312,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
     // ✅ If the highlighted selection intersects ANY existing link (even partially),
     // do NOT open the link menu.
-    const overlapsExistingLink = activeDoc.entityLinks.some(
+    const overlapsExistingLink = activeEditorLinks.some(
       (l) => !(range.end <= l.start || range.start >= l.end)
     );
     if (overlapsExistingLink) {
@@ -7007,7 +7333,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
   const handleCaretLinkChange = useCallback(
     (payload: { linkId: Id | null; anchorRect: AnchorRect | null }) => {
-      if (!project || !activeDoc) return;
+      if (!project || !hasActiveEditor) return;
 
       setCaretLinkId(payload.linkId);
       setLinkPopoverAnchorRect(payload.anchorRect);
@@ -7023,10 +7349,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         return;
       }
 
-      const link = activeDoc.entityLinks.find((l) => l.id === payload.linkId);
+      const link = activeEditorLinks.find((l) => l.id === payload.linkId);
       if (!link) return;
 
-      const text = activeDoc.content.slice(link.start, link.end);
+      const text = activeEditorContent.slice(link.start, link.end);
 
       setLinkingSelection({ start: link.start, end: link.end, text });
       setLinkingCollectionId(link.collectionId);
@@ -7034,7 +7360,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       setEditingLinkId(link.id);
       setLinkingNotice(null);
     },
-    [project, activeDoc, linkingSelection, editingLinkId]
+    [project, activeDoc, showRecordPage, recordPageRow, linkingSelection, editingLinkId]
   );
 
   // Replace a document's derived link index (chips report their offsets up here).
@@ -7053,6 +7379,151 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     });
   };
 
+  // ── Record "as a page" ──────────────────────────────────────────────────────
+  const openRecordPage = (collectionId: Id, rowId: Id) => {
+    setRecordPage({ collectionId, rowId });
+    setActiveCollectionId(collectionId);
+    setFocusView("doc"); // ensure the primary editor slot is visible (no-op in dual)
+    // Move the sidebar highlight to the record's table so a previously-open document
+    // no longer appears selected while the record page is what's actually showing.
+    setTreeSelection(new Set(["colitem:" + collectionId]));
+    treeAnchorRef.current = "colitem:" + collectionId;
+    closeLinkEditor();
+  };
+  const closeRecordPage = () => {
+    // In focus mode, return to the table the record came from (not an empty doc slot).
+    if (layoutMode === "focus") setFocusView("collection");
+    setRecordPage(null);
+    closeLinkEditor();
+  };
+
+  // Patch a single row (used by the page editor for properties + the rich description).
+  const patchRow = (
+    collectionId: Id,
+    rowId: Id,
+    patch: Partial<CollectionRow> & { values?: Record<string, string | number> }
+  ) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        collections: prev.collections.map((c) =>
+          c.id !== collectionId ? c : {
+            ...c,
+            rows: c.rows.map((r) =>
+              r.id !== rowId ? r : { ...r, ...patch, values: patch.values ? { ...r.values, ...patch.values } : r.values }
+            ),
+          }
+        ),
+      };
+    });
+  };
+
+  const updateRecordDescriptionLinks = (collectionId: Id, rowId: Id, links: EntityLink[]) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      let changed = false;
+      const collections = prev.collections.map((c) => {
+        if (c.id !== collectionId) return c;
+        return {
+          ...c,
+          rows: c.rows.map((r) => {
+            if (r.id !== rowId) return r;
+            const norm = links.map((l) => ({ ...l, docId: rowId }));
+            if (JSON.stringify(norm) === JSON.stringify(r.descriptionLinks ?? [])) return r;
+            changed = true;
+            return { ...r, descriptionLinks: norm };
+          }),
+        };
+      });
+      return changed ? { ...prev, collections } : prev;
+    });
+  };
+
+  const openReplaceModal = () => {
+    setFileMenuOpen(false);
+    setReplaceFind("");
+    setReplaceWith("");
+    setReplaceMatchCase(false);
+    setReplaceScopeAll(true);
+    setReplaceDocIds(project?.documents.map((d) => d.id) ?? []);
+    setReplaceModalOpen(true);
+  };
+
+  // Replace plain text across documents. Linked text (chips) is never touched, even
+  // when it matches, so only normal prose changes.
+  const runReplaceAcrossDocuments = async () => {
+    if (!project || !replaceFind) return;
+    const targetIds = replaceScopeAll
+      ? new Set(project.documents.map((d) => d.id))
+      : new Set(replaceDocIds);
+    if (targetIds.size === 0) return;
+
+    setReplaceBusy(true);
+    try {
+      let totalReplacements = 0;
+      let docsChanged = 0;
+      let recordsChanged = 0;
+      const documents = project.documents.map((d) => {
+        if (!targetIds.has(d.id)) return d;
+        let res: ReturnType<typeof replaceTextInDoc> = null;
+        try {
+          res = replaceTextInDoc(d, replaceFind, replaceWith, replaceMatchCase);
+        } catch {
+          res = null;
+        }
+        if (!res) return d;
+        totalReplacements += res.count;
+        docsChanged += 1;
+        return { ...d, richContent: res.richContent, content: res.content, entityLinks: res.entityLinks };
+      });
+
+      // Record descriptions are rich bodies just like documents. Run the same replace
+      // over them (chips/linked text are skipped), but only in the "All" scope since
+      // records aren't part of the document selection. Linked text is never changed.
+      const collections = replaceScopeAll
+        ? project.collections.map((c) => {
+            let touched = false;
+            const rows = c.rows.map((r) => {
+              const plain = String((r.values as any)?.description ?? "");
+              if (!r.descriptionRich && !plain) return r;
+              const shaped: any = { id: r.id, content: plain, richContent: r.descriptionRich, entityLinks: r.descriptionLinks ?? [] };
+              let res: ReturnType<typeof replaceTextInDoc> = null;
+              try {
+                res = replaceTextInDoc(shaped, replaceFind, replaceWith, replaceMatchCase);
+              } catch {
+                res = null;
+              }
+              if (!res) return r;
+              totalReplacements += res.count;
+              recordsChanged += 1;
+              touched = true;
+              return { ...r, descriptionRich: res.richContent, descriptionLinks: res.entityLinks, values: { ...r.values, description: res.content } };
+            });
+            return touched ? { ...c, rows } : c;
+          })
+        : project.collections;
+
+      if (totalReplacements === 0) {
+        await appModal.alert("No unlinked text matched. Linked text is never changed.", { title: "Nothing to replace" });
+        return;
+      }
+
+      setProject((prev) => (prev ? { ...prev, documents, collections } : prev));
+      setReplaceModalOpen(false);
+      const where = [
+        docsChanged > 0 ? `${docsChanged} document${docsChanged === 1 ? "" : "s"}` : null,
+        recordsChanged > 0 ? `${recordsChanged} record${recordsChanged === 1 ? "" : "s"}` : null,
+      ].filter(Boolean).join(" and ");
+      await appModal.alert(
+        `Replaced ${totalReplacements} occurrence${totalReplacements === 1 ? "" : "s"} across ${where}. Linked text was left untouched.`,
+        { title: "Replaced" }
+      );
+    } finally {
+      setReplaceBusy(false);
+    }
+  };
+
   const newLinkId = () => `link_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
   // Slash-link: the typeahead already inserted the record's label as plain text at
@@ -7064,7 +7535,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     collectionId: Id;
     entityId: Id;
   }) => {
-    if (!project || !activeDoc) return;
+    if (!project || !hasActiveEditor) return;
     const label = labelResolver(payload.collectionId, payload.entityId) ?? payload.newText.slice(payload.start, payload.end);
     linkApiRef.current?.wrapRange(payload.start, payload.end, label, {
       linkId: newLinkId(),
@@ -7076,15 +7547,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   };
 
   const saveLink = () => {
-    if (!project || !activeDoc || !linkingCollectionId || !linkingEntityId) return;
+    if (!project || !hasActiveEditor || !linkingCollectionId || !linkingEntityId) return;
     const label = labelResolver(linkingCollectionId, linkingEntityId) ?? "";
     const color = colorResolver(linkingCollectionId);
 
     if (editingLinkId) {
       // Re-point an existing chip at the chosen record. Relabel only if it was a
       // single-word (label-tracking) span.
-      const existing = activeDoc.entityLinks.find((l) => l.id === editingLinkId);
-      const curText = existing ? activeDoc.content.slice(existing.start, existing.end) : "";
+      const existing = activeEditorLinks.find((l) => l.id === editingLinkId);
+      const curText = existing ? activeEditorContent.slice(existing.start, existing.end) : "";
       linkApiRef.current?.updateLink(editingLinkId, {
         collectionId: linkingCollectionId,
         entityId: linkingEntityId,
@@ -7094,14 +7565,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       });
     } else {
       if (!linkingSelection) return;
-      const overlapsNow = activeDoc.entityLinks.some(
+      const overlapsNow = activeEditorLinks.some(
         (l) => !(linkingSelection.end <= l.start || linkingSelection.start >= l.end)
       );
       if (overlapsNow) {
         setLinkingNotice("Selection overlaps an existing link. Click the highlighted text to edit/unlink it.");
         return;
       }
-      const selText = activeDoc.content.slice(linkingSelection.start, linkingSelection.end);
+      const selText = activeEditorContent.slice(linkingSelection.start, linkingSelection.end);
       const single = isSingleWord(selText);
       linkApiRef.current?.wrapRange(linkingSelection.start, linkingSelection.end, single ? (label || selText) : selText, {
         linkId: newLinkId(),
@@ -7284,17 +7755,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const signInModalNode = signInModalOpen ? (
     <div style={{ position: "fixed", inset: 0, background: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200 }}>
       <div style={{ width: 360, maxWidth: "90vw", background: "var(--bg-elevated)", border: "1px solid var(--border-2)", borderRadius: 12, padding: 18 }}>
-        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 12 }}>Sign in to sync</div>
+        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 12 }}>{t("profile.signInToSync")}</div>
         <input
           type="email"
-          placeholder="Email"
+          placeholder={t("auth.email")}
           value={signInEmail}
           onChange={(e) => setSignInEmail(e.target.value)}
           style={{ width: "100%", boxSizing: "border-box", marginBottom: 8, borderRadius: 8, border: "1px solid var(--border-2)", background: "var(--bg-surface)", color: "var(--text)", padding: "9px 10px", fontSize: 13 }}
         />
         <input
           type="password"
-          placeholder="Password"
+          placeholder={t("auth.password")}
           value={signInPassword}
           onChange={(e) => setSignInPassword(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") desktopSignIn(); }}
@@ -7329,12 +7800,13 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   if (needsVaultPicker) {
     return (
       <div style={{ minHeight: "100vh", maxHeight: "100vh", overflowY: "auto", boxSizing: "border-box", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "safe center", backgroundColor: "var(--bg)", color: "var(--text)", fontFamily: "system-ui", gap: 18, padding: "48px 32px" }}>
+        <div style={{ position: "fixed", top: 14, right: 18, zIndex: 10 }}><LanguageSelect compact /></div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <img src="/rpgst_logo.png" alt="" style={{ width: 40, height: 40, borderRadius: 8 }} />
           <div style={{ fontSize: 26, fontWeight: 800 }}>RPG Story Toolkit</div>
         </div>
         <div style={{ fontSize: 14, opacity: 0.7, textAlign: "center", maxWidth: 460 }}>
-          Choose a project to work on. Each project is a folder the app reads and writes files into, so your game engine can pick them up in real time.
+          {t("launcher.subtitle")}
         </div>
 
         {initError && (
@@ -7345,7 +7817,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         {recentVaults.length > 0 && (
           <div style={{ width: "100%", maxWidth: 520, display: "flex", flexDirection: "column", gap: 6 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 2 }}>
-              Recent projects
+              {t("launcher.recentProjects")}
             </div>
             {recentVaults.slice(0, 8).map((v) => {
               const status = vaultStatus[v.path]; // undefined = checking, false = missing, true = ok
@@ -7384,7 +7856,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       {v.name}
                     </div>
                     <div style={{ fontSize: 11, opacity: 0.6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {missing ? "Can't find this project. It may have been moved or deleted." : v.path}
+                      {missing ? t("launcher.missingProject") : v.path}
                     </div>
                   </button>
                   {vaultSyncStatus[v.path] && (
@@ -7392,19 +7864,19 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       title={syncSession ? "Synced to your web account" : "Linked to a web account — sign in to sync"}
                       style={{ flexShrink: 0, fontSize: 10, fontWeight: 700, borderRadius: 999, padding: "2px 8px", border: "1px solid var(--accent)", background: "var(--accent-bg-2)", color: "var(--accent-text)" }}
                     >
-                      {syncSession ? "☁ Synced" : "☁ Linked"}
+                      {syncSession ? `☁ ${t("launcher.synced")}` : `☁ ${t("launcher.linked")}`}
                     </span>
                   )}
                   <span
                     title="Stored on this device"
                     style={{ flexShrink: 0, fontSize: 10, fontWeight: 700, borderRadius: 999, padding: "2px 8px", border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-dim)" }}
                   >
-                    Local
+                    {t("launcher.local")}
                   </span>
                   <button
                     type="button"
                     onClick={() => handleRemoveRecent(v.path)}
-                    title="Remove from recents"
+                    title={t("launcher.removeFromRecents")}
                     style={{ border: "none", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 4 }}
                   >
                     ✕
@@ -7418,7 +7890,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 onClick={() => setAllProjectsModalOpen(true)}
                 style={{ alignSelf: "center", marginTop: 2, border: "none", background: "transparent", color: "var(--text-2)", cursor: "pointer", fontSize: 12, textDecoration: "underline", padding: "4px 8px" }}
               >
-                +{recentVaults.length - 8} more
+                +{recentVaults.length - 8} {t("launcher.more")}
               </button>
             )}
           </div>
@@ -7428,7 +7900,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         {syncSession && launcherWebProjects.filter((p) => !linkedWebIds.has(p.id)).length > 0 && (
           <div style={{ width: "100%", maxWidth: 520, display: "flex", flexDirection: "column", gap: 6 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 2 }}>
-              Available from your web account
+              {t("launcher.availableFromWeb")}
             </div>
             {launcherWebProjects.filter((p) => !linkedWebIds.has(p.id)).slice(0, 8).map((p) => (
               <div
@@ -7442,14 +7914,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   style={{ flex: 1, minWidth: 0, textAlign: "left", border: "none", background: "transparent", color: "var(--text)", cursor: "pointer", padding: 0 }}
                   title="Import this project to a new folder on this device"
                 >
-                  <div style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name || "Untitled"}</div>
-                  <div style={{ fontSize: 11, opacity: 0.6 }}>Not on this device — click to import</div>
+                  <div style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name || t("common.untitled")}</div>
+                  <div style={{ fontSize: 11, opacity: 0.6 }}>{t("launcher.notOnDevice")}</div>
                 </button>
                 <span
                   title="On your web account"
                   style={{ flexShrink: 0, fontSize: 10, fontWeight: 700, borderRadius: 999, padding: "2px 8px", border: "1px solid var(--accent)", background: "var(--accent-bg-2)", color: "var(--accent-text)" }}
                 >
-                  ☁ Web
+                  ☁ {t("launcher.web")}
                 </span>
               </div>
             ))}
@@ -7459,7 +7931,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 onClick={() => setAllProjectsModalOpen(true)}
                 style={{ alignSelf: "center", marginTop: 2, border: "none", background: "transparent", color: "var(--text-2)", cursor: "pointer", fontSize: 12, textDecoration: "underline", padding: "4px 8px" }}
               >
-                +{launcherWebProjects.filter((p) => !linkedWebIds.has(p.id)).length - 8} more
+                +{launcherWebProjects.filter((p) => !linkedWebIds.has(p.id)).length - 8} {t("launcher.more")}
               </button>
             )}
           </div>
@@ -7471,25 +7943,25 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             onClick={handleCreateNewProject}
             style={{ padding: "12px 24px", fontSize: 15, borderRadius: 8, cursor: vaultPickerBusy ? "default" : "pointer", border: "none", background: "var(--accent, #5b7fff)", color: "#fff", fontWeight: 600 }}
           >
-            {vaultPickerBusy ? "Opening…" : "Create new project"}
+            {vaultPickerBusy ? t("file.opening") : t("launcher.createProject")}
           </button>
           <button
             disabled={vaultPickerBusy}
             onClick={() => openVaultAndLoad(null)}
             style={{ padding: "12px 24px", fontSize: 15, borderRadius: 8, cursor: vaultPickerBusy ? "default" : "pointer", border: "1px solid var(--border-2)", background: "var(--bg-elevated)", color: "var(--text)", fontWeight: 600 }}
           >
-            Open project…
+            {t("launcher.openProject")}
           </button>
           <button
             disabled={vaultPickerBusy || transferBusy}
             onClick={handleLauncherImport}
             style={{ padding: "12px 24px", fontSize: 15, borderRadius: 8, cursor: (vaultPickerBusy || transferBusy) ? "default" : "pointer", border: "1px solid var(--border-2)", background: "var(--bg-elevated)", color: "var(--text)", fontWeight: 600 }}
           >
-            Import project…
+            {t("file.importProject")}
           </button>
         </div>
         <div style={{ fontSize: 11, opacity: 0.55, textAlign: "center", maxWidth: 460, marginTop: -6 }}>
-          <b>Create new project</b> makes a dedicated folder inside the folder you pick{syncSession && syncIsPro ? " and syncs it to your web account" : ""}. <b>Open project…</b> opens an existing one. <b>Import project…</b> brings in a project {syncSession ? "from your web account or a file" : `from a .${PROJECT_FILE_EXT} file`}.
+          {t("launcher.help")}
         </div>
 
         {/* Web-account sign-in status (desktop) */}
@@ -7497,26 +7969,26 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           {!syncSession ? (
             <>
               <div style={{ fontSize: 12, opacity: 0.7, textAlign: "center" }}>
-                Sign in to your web account to sync projects between desktop and web (Pro).
+                {t("launcher.signInPrompt")}
               </div>
               <button
                 onClick={() => setSignInModalOpen(true)}
                 style={{ padding: "10px 18px", fontSize: 14, borderRadius: 8, cursor: "pointer", border: "1px solid var(--border-2)", background: "var(--bg-elevated)", color: "var(--text)", fontWeight: 600 }}
               >
-                Sign in to sync
+                {t("profile.signInToSync")}
               </button>
             </>
           ) : (
             <>
               <div style={{ fontSize: 12, textAlign: "center" }}>
-                Signed in as <b>{syncSession.user?.email ?? "your account"}</b>
+                {t("launcher.signedInAs")} <b>{syncSession.user?.email ?? ""}</b>
                 {syncIsPro ? <span style={{ marginLeft: 6, fontSize: 10, fontWeight: 800, color: "var(--accent-text)", background: "var(--accent-bg-2)", border: "1px solid var(--accent)", borderRadius: 999, padding: "1px 6px" }}>PRO</span> : null}
               </div>
               <button
                 onClick={desktopSignOut}
                 style={{ alignSelf: "center", border: "none", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 11, textDecoration: "underline", padding: "2px 6px" }}
               >
-                Sign out
+                {t("launcher.signOut")}
               </button>
             </>
           )}
@@ -7542,24 +8014,24 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         {importChooserOpen && (
           <div style={{ position: "fixed", inset: 0, background: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200 }}>
             <div style={{ width: 360, maxWidth: "90vw", background: "var(--bg-elevated)", border: "1px solid var(--border-2)", borderRadius: 12, padding: 18 }}>
-              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>Import a project</div>
-              <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 14 }}>Bring in a project from your web account or from a file.</div>
+              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>{t("launcher.importTitle")}</div>
+              <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 14 }}>{t("launcher.importDesc")}</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 <button
                   onClick={() => { setImportChooserOpen(false); pullProjectFromWeb(); }}
                   style={{ textAlign: "left", borderRadius: 8, border: "1px solid var(--border-3)", background: "var(--bg-surface)", color: "var(--text)", padding: "11px 12px", fontSize: 13, cursor: "pointer", fontWeight: 600 }}
                 >
-                  From your web account
+                  {t("launcher.fromWebAccount")}
                 </button>
                 <button
                   onClick={() => { setImportChooserOpen(false); importFileInputRef.current?.click(); }}
                   style={{ textAlign: "left", borderRadius: 8, border: "1px solid var(--border-3)", background: "var(--bg-surface)", color: "var(--text)", padding: "11px 12px", fontSize: 13, cursor: "pointer", fontWeight: 600 }}
                 >
-                  From a file (.{PROJECT_FILE_EXT})
+                  {t("launcher.fromFile")} (.{PROJECT_FILE_EXT})
                 </button>
               </div>
               <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
-                <button onClick={() => setImportChooserOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-2)", padding: "8px 12px", fontSize: 13, cursor: "pointer" }}>Cancel</button>
+                <button onClick={() => setImportChooserOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-2)", padding: "8px 12px", fontSize: 13, cursor: "pointer" }}>{t("common.cancel")}</button>
               </div>
             </div>
           </div>
@@ -7569,7 +8041,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         {webPickerOpen && (
           <div style={{ position: "fixed", inset: 0, background: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200 }}>
             <div style={{ width: 400, maxWidth: "90vw", maxHeight: "70vh", overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border-2)", borderRadius: 12, padding: 18 }}>
-              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>Import from your web account</div>
+              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>{t("dlg.importFromWeb")}</div>
               <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 12 }}>Pick a project to copy into a new local vault (you'll choose a folder next).</div>
               {webPickerProjects.length === 0 && <div style={{ fontSize: 13, opacity: 0.6, padding: "8px 0" }}>No projects found on this account.</div>}
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -7584,7 +8056,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 ))}
               </div>
               <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
-                <button onClick={() => setWebPickerOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-2)", padding: "8px 12px", fontSize: 13, cursor: "pointer" }}>Cancel</button>
+                <button onClick={() => setWebPickerOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-2)", padding: "8px 12px", fontSize: 13, cursor: "pointer" }}>{t("common.cancel")}</button>
               </div>
             </div>
           </div>
@@ -7594,7 +8066,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         {allProjectsModalOpen && (
           <div style={{ position: "fixed", inset: 0, background: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200 }}>
             <div style={{ width: 460, maxWidth: "92vw", maxHeight: "80vh", display: "flex", flexDirection: "column", background: "var(--bg-elevated)", border: "1px solid var(--border-2)", borderRadius: 12, padding: 18 }}>
-              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 12 }}>All projects</div>
+              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 12 }}>{t("dlg.allProjects")}</div>
               <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                   <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: "0.06em" }}>On this device</div>
@@ -7633,7 +8105,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 )}
               </div>
               <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
-                <button onClick={() => setAllProjectsModalOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-2)", padding: "8px 12px", fontSize: 13, cursor: "pointer" }}>Close</button>
+                <button onClick={() => setAllProjectsModalOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-2)", padding: "8px 12px", fontSize: 13, cursor: "pointer" }}>{t("common.close")}</button>
               </div>
             </div>
           </div>
@@ -7671,8 +8143,100 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     );
   }
 
+  // Dual-view embedded tool panel (web only): Timeline or World Map filling a side panel.
+  // Its Close button returns to normal Dual view.
+  const renderDualToolPanel = () => {
+    if (!project) return null;
+    return (
+      <Panel
+        id="tool-panel"
+        order={dualToolSide === "left" ? 2 : 5}
+        defaultSize={44}
+        minSize={24}
+      >
+        <div style={{ height: "100%", position: "relative", borderLeft: dualToolSide === "right" ? "1px solid var(--border-2)" : "none", borderRight: dualToolSide === "left" ? "1px solid var(--border-2)" : "none", boxSizing: "border-box", overflow: "hidden" }}>
+          {dualTool === "worldmap" ? (
+            <WorldMap
+              embedded
+              imageUrl={worldMapImageUrl}
+              worldName={project.view?.worldMapName ?? ""}
+              worldNameCollectionId={project.view?.worldMapNameCollectionId}
+              worldNameEntityId={project.view?.worldMapNameEntityId}
+              worldMapIncludeInWiki={project.view?.worldMapIncludeInWiki ?? false}
+              docPins={(project.worldMapDocPins ?? []) as WorldMapDocPin[]}
+              labelPins={(project.worldMapLabelPins ?? []) as WorldMapLabelPin[]}
+              documents={project.documents}
+              collections={project.collections}
+              onClose={() => setDualTool(null)}
+              onUploadImage={uploadWorldMapImage}
+              onPickImagePath={setWorldMapImageFromAsset}
+              onRemoveImage={removeWorldMapImage}
+              onSetWorldName={setWorldMapName}
+              onSetIncludeInWiki={setWorldMapIncludeInWiki}
+              onAddDocPin={addWorldMapDocPin}
+              onMoveDocPin={updateWorldMapDocPinPos}
+              onRemoveDocPin={removeWorldMapDocPin}
+              onAddLabelPin={addWorldMapLabelPin}
+              onMoveLabelPin={updateWorldMapLabelPinPos}
+              onRemoveLabelPin={removeWorldMapLabelPin}
+              onSetDocPinBorder={setWorldMapDocPinBorder}
+              onSetLabelPinBorder={setWorldMapLabelPinBorder}
+              onOpenDoc={(id) => { setActiveDocId(id); }}
+              onOpenRecord={(cid, eid) => openRecordPage(cid, eid)}
+              onSave={() => saveProjectToSupabase()}
+              showWikiOption={!isDesktop}
+              savedMaps={(archiveActiveWorldMap(project).worldMaps).map((m) => ({ id: m.id, name: m.name, hasImage: !!m.imagePath }))}
+              activeMapId={project.view?.activeWorldMapId ?? ""}
+              onMakeNewMap={makeNewWorldMap}
+              onLoadMap={loadWorldMap}
+              onSelectRecord={selectOrCreateWorldMapForRecord}
+              onClearDocPins={clearWorldMapDocPins}
+              onClearLabelPins={clearWorldMapLabelPins}
+              saveMessage={saveMessage}
+            />
+          ) : (
+            <Timeline
+              bare
+              enabled
+              documents={project.documents}
+              collections={project.collections}
+              labels={timelineLabels}
+              beatCount={timelineBeatCount}
+              timelineCovers={timelineCoverUrls}
+              sectionTitles={project.view?.timelineSectionTitles ?? {}}
+              onRenameSection={renameTimelineSection}
+              onInsertBeat={insertBeatAfter}
+              onRemoveBeat={removeBeatAt}
+              onMoveDoc={moveDocOnTimeline}
+              onOpenDoc={(id) => setActiveDocId(id)}
+              onAddEntityLabel={addTimelineEntityLabel}
+              onDeleteLabel={deleteTimelineLabel}
+              onUploadCover={uploadTimelineCover}
+              onRemoveCover={removeTimelineCover}
+              onSelectEntity={openEntityInCollection}
+              style={timelineStyle}
+              onSetStyle={setTimelineStyle}
+              lineDocs={timelineLine.docs}
+              linePins={timelineLine.pins}
+              onAddLineDoc={addTimelineLineDoc}
+              onUpdateLineDoc={updateTimelineLineDoc}
+              onRemoveLineDoc={removeTimelineLineDoc}
+              onAddLinePin={addTimelineLinePin}
+              onUpdateLinePin={updateTimelineLinePin}
+              onRemoveLinePin={removeTimelineLinePin}
+              onSetLineOrder={setTimelineLineOrder}
+              onClose={() => setDualTool(null)}
+            />
+          )}
+        </div>
+      </Panel>
+    );
+  };
+
   return (
     <div style={{ height: "100vh", width: "100vw", fontFamily: "system-ui", backgroundColor: "var(--bg)", color: "var(--text)" }}>
+      {personaPromptOpen && <PersonaPrompt onDone={handlePersonaDone} />}
+
       {/* Offline indicator (fixed; doesn't affect layout) */}
       {isOffline && (
         <div
@@ -7742,10 +8306,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             >
               {isDesktop ? (
                 syncSession ? (
-                  // Signed in to a web account on desktop — show its initial.
-                  <span style={{ fontSize: 14, fontWeight: 700, opacity: 0.9 }}>
-                    {(syncSession.user?.email ?? "U").trim().charAt(0).toUpperCase()}
-                  </span>
+                  // Signed in to a web account on desktop — show its profile picture,
+                  // falling back to the account initial.
+                  avatarUrl ? (
+                    <img src={avatarUrl} alt="avatar" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  ) : (
+                    <span style={{ fontSize: 14, fontWeight: 700, opacity: 0.9 }}>
+                      {(syncSession.user?.email ?? "U").trim().charAt(0).toUpperCase()}
+                    </span>
+                  )
                 ) : (
                   <img src="/rpgst_logo.png" alt="RPG Story Toolkit" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                 )
@@ -7801,20 +8370,20 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 }}
               >
                 {!isDesktop && !profile?.is_pro && (
-                  <BreakEvenBar costs={MONTHLY_COSTS} earnings={MONTHLY_EARNINGS} />
+                  <BreakEvenBar costs={MONTHLY_COSTS} earningsPct={MONTHLY_EARNINGS_PCT} />
                 )}
 
                 {isDesktop && (
                   <div style={{ fontSize: 12, opacity: 0.9, marginBottom: 8 }}>
                     {syncSession ? (
                       <>
-                        <div style={{ fontWeight: 700 }}>{syncSession.user?.email ?? "Signed in"}</div>
-                        <div style={{ opacity: 0.7 }}>{syncIsPro ? "Pro account" : "Free account"}</div>
+                        <div style={{ fontWeight: 700 }}>{syncSession.user?.email ?? t("profile.signedIn")}</div>
+                        <div style={{ opacity: 0.7 }}>{syncIsPro ? t("profile.proAccount") : t("profile.freeAccount")}</div>
                       </>
                     ) : (
                       <>
-                        <div style={{ fontWeight: 700 }}>Not signed in</div>
-                        <div style={{ opacity: 0.7 }}>Local only — sign in to sync.</div>
+                        <div style={{ fontWeight: 700 }}>{t("profile.notSignedIn")}</div>
+                        <div style={{ opacity: 0.7 }}>{t("profile.localOnly")}</div>
                       </>
                     )}
                   </div>
@@ -7823,14 +8392,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 {!isDesktop && !isGuest && (
                   <div style={{ fontSize: 12, opacity: 0.9, marginBottom: 8 }}>
                     <div style={{ fontWeight: 700 }}>{profile?.username ?? emailToDefaultUsername(userEmail)}</div>
-                    <div style={{ opacity: 0.7 }}>{userEmail ?? "(no email)"}</div>
+                    <div style={{ opacity: 0.7 }}>{userEmail ?? t("profile.noEmail")}</div>
                   </div>
                 )}
 
                 {!isDesktop && isGuest && (
                   <div style={{ fontSize: 12, opacity: 0.9, marginBottom: 8 }}>
-                    <div style={{ fontWeight: 700 }}>Guest</div>
-                    <div style={{ opacity: 0.7 }}>No account — work is saved on this device.</div>
+                    <div style={{ fontWeight: 700 }}>{t("profile.guest")}</div>
+                    <div style={{ opacity: 0.7 }}>{t("profile.guestNote")}</div>
                   </div>
                 )}
 
@@ -7841,7 +8410,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       onClick={() => { setProfileMenuOpen(false); setSignInModalOpen(true); }}
                       style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: "var(--accent-bg-2)", color: "var(--accent-text)", cursor: "pointer", padding: "8px 10px", fontSize: 13, fontWeight: 700, textAlign: "left" }}
                     >
-                      Sign in to sync
+                      {t("profile.signInToSync")}
                     </button>
                   )}
 
@@ -7853,7 +8422,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       onClick={() => setProfileMenuOpen(false)}
                       style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13, textAlign: "left", textDecoration: "none", display: "block" }}
                     >
-                      Account settings (web) ↗
+                      {t("profile.accountSettingsWeb")} ↗
                     </a>
                   )}
 
@@ -7876,7 +8445,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         textAlign: "left",
                       }}
                     >
-                      Create account
+                      {t("profile.createAccount")}
                     </button>
                   )}
 
@@ -7895,7 +8464,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       textAlign: "left",
                     }}
                   >
-                    Profile settings
+                    {t("profile.profileSettings")}
                   </button>
                   )}
 
@@ -7916,7 +8485,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         textAlign: "left",
                       }}
                     >
-                      {isUpgrading ? "Opening checkout…" : "Upgrade to Pro"}
+                      {isUpgrading ? t("profile.openingCheckout") : t("profile.upgradePro")}
                     </button>
                   )}
 
@@ -7937,7 +8506,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       width: "100%",
                     }}
                   >
-                    Contact Support
+                    {t("profile.contactSupport")}
                   </button>
 
                   {isDesktop && syncSession && (
@@ -7949,7 +8518,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       }}
                       style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13, textAlign: "left" }}
                     >
-                      Log out
+                      {t("common.logOut")}
                     </button>
                   )}
 
@@ -7958,10 +8527,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     type="button"
                     onClick={async () => {
                       const ok = await appModal.confirm({
-                        title: "Log out?",
-                        message: "You'll be returned to the sign-in screen.",
-                        confirmText: "Log out",
-                        cancelText: "Cancel",
+                        title: t("dialog.logoutTitle"),
+                        message: t("dialog.logoutMessage"),
+                        confirmText: t("common.logOut"),
+                        cancelText: t("common.cancel"),
                       });
                       if (ok) logout();
                     }}
@@ -7976,7 +8545,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       textAlign: "left",
                     }}
                   >
-                    Log out
+                    {t("common.logOut")}
                   </button>
                   )}
                 </div>
@@ -8012,7 +8581,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 padding: "6px 10px",
               }}
             >
-              File ▾
+              {t("menu.file")} ▾
             </button>
 
             {fileMenuOpen && (
@@ -8060,7 +8629,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         gap: 10,
                       }}
                     >
-                      <span>{saving ? "Saving…" : "Save now"}</span>
+                      <span>{saving ? t("file.saving") : t("file.saveNow")}</span>
                       <span style={{ opacity: 0.5 }}>⌘S</span>
                     </button>
                     <div style={{ height: 1, backgroundColor: "var(--border)", margin: "0 0 10px 0" }} />
@@ -8089,17 +8658,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         marginBottom: 6,
                       }}
                     >
-                      Wiki settings…
+                      {t("file.wikiSettings")}
                     </button>
 
                     <button
                       type="button"
                       onClick={async () => {
                         const ok = await appModal.confirm({
-                          title: "Unpublish wiki?",
-                          message: "Your wiki will no longer be publicly accessible. You can re-publish it at any time.",
-                          confirmText: "Unpublish",
-                          cancelText: "Cancel",
+                          title: t("wiki.unpublishTitle"),
+                          message: t("wiki.unpublishMsg"),
+                          confirmText: t("wiki.unpublish"),
+                          cancelText: t("common.cancel"),
                           danger: true,
                         });
                         if (!ok) return;
@@ -8119,7 +8688,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         marginBottom: 10,
                       }}
                     >
-                      Unpublish wiki
+                      {t("file.unpublishWiki")}
                     </button>
 
                     <div style={{ height: 1, backgroundColor: "var(--border)", margin: "0 0 10px 0" }} />
@@ -8145,7 +8714,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         marginBottom: 10,
                       }}
                     >
-                      Publish as a wiki…
+                      {t("file.publishWiki")}
                     </button>
 
                     <div style={{ height: 1, backgroundColor: "var(--border)", margin: "0 0 10px 0" }} />
@@ -8172,7 +8741,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       marginBottom: 8,
                     }}
                   >
-                    New project{!profile?.is_pro ? "  ·  Pro" : ""}
+                    {t("file.newProject")}{!profile?.is_pro ? "  ·  Pro" : ""}
                   </button>
                 )}
 
@@ -8198,7 +8767,26 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     marginBottom: 8,
                   }}
                 >
-                  Conditions…
+                  {t("file.conditions")}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={openReplaceModal}
+                  style={{
+                    width: "100%",
+                    borderRadius: 8,
+                    border: "1px solid var(--border-3)",
+                    backgroundColor: "transparent",
+                    color: "var(--text-2)",
+                    cursor: "pointer",
+                    padding: "8px 10px",
+                    fontSize: 13,
+                    textAlign: "left",
+                    marginBottom: 8,
+                  }}
+                >
+                  {t("file.replaceText")}
                 </button>
 
                 {/* Portable project transfer (web <-> desktop) */}
@@ -8219,7 +8807,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     marginBottom: 6,
                   }}
                 >
-                  {transferBusy ? "Working…" : `Export project (.${PROJECT_FILE_EXT})`}
+                  {transferBusy ? t("file.working") : `${t("file.exportProject")} (.${PROJECT_FILE_EXT})`}
                 </button>
                 <button
                   type="button"
@@ -8238,7 +8826,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     marginBottom: 8,
                   }}
                 >
-                  Import project…
+                  {t("file.importProject")}
                 </button>
 
                 {/* Export submenu */}
@@ -8267,7 +8855,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       gap: 10,
                     }}
                   >
-                    <span>Export</span>
+                    <span>{t("file.export")}</span>
                     <span style={{ opacity: 0.9 }}>▸</span>
                   </button>
 
@@ -8311,7 +8899,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           textAlign: "left",
                         }}
                       >
-                        Export condition JSON
+                        {t("file.exportConditionJson")}
                       </button>
 
                       <div style={{ height: 1, backgroundColor: "var(--border)", margin: "6px 0" }} />
@@ -8337,7 +8925,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           textAlign: "left",
                         }}
                       >
-                        Export tables…
+                        {t("file.exportTables")}
                       </button>
 
                       <button
@@ -8361,7 +8949,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           textAlign: "left",
                         }}
                       >
-                        Export documents…
+                        {t("file.exportDocuments")}
                       </button>
 
                       <div style={{ height: 1, backgroundColor: "var(--border)", margin: "6px 0" }} />
@@ -8386,10 +8974,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           textAlign: "left",
                         }}
                       >
-                        Export assets (ZIP)
+                        {t("file.exportAssets")}
                       </button>
                     </div>
                   )}
+                </div>
+
+                {/* Language (you usually set this on the starter screen; tucked here, not prominent) */}
+                <div style={{ height: 1, backgroundColor: "var(--border)", margin: "10px 0" }} />
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "4px 10px 6px" }}>
+                  <span style={{ fontSize: 13, color: "var(--text-2)" }}>{t("lang.label")}</span>
+                  <LanguageSelect compact />
                 </div>
 
                 {isDesktop && (
@@ -8416,17 +9011,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           gap: 10,
                         }}
                       >
-                        <span>Sync now</span>
+                        <span>{t("file.syncNow")}</span>
                         <span style={{ opacity: 0.85, fontWeight: 600 }}>
                           {webHasNewer && localUnpushed
-                            ? "both changed"
+                            ? t("sync.bothChanged")
                             : webHasNewer
-                              ? "newer on web"
+                              ? t("sync.newerOnWeb")
                               : localUnpushed
-                                ? "not synced"
+                                ? t("sync.notSynced")
                                 : syncMeta.lastSyncedAt
-                                  ? `synced ${new Date(syncMeta.lastSyncedAt).toLocaleDateString()}`
-                                  : "linked"}
+                                  ? `${t("sync.syncedOn")} ${new Date(syncMeta.lastSyncedAt).toLocaleDateString()}`
+                                  : t("sync.linked")}
                         </span>
                       </button>
 
@@ -8458,7 +9053,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           gap: 10,
                         }}
                       >
-                        <span>Auto-sync on save</span>
+                        <span>{t("file.autoSync")}</span>
                         <span
                           style={{
                             flexShrink: 0,
@@ -8471,7 +9066,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                             color: autoSyncOnSave ? "var(--accent-text)" : "var(--text-dim)",
                           }}
                         >
-                          {autoSyncOnSave ? "On" : "Off"}
+                          {autoSyncOnSave ? t("common.on") : t("common.off")}
                         </span>
                       </button>
                       </>
@@ -8491,7 +9086,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           textAlign: "left",
                         }}
                       >
-                        Sync to web…
+                        {t("file.syncToWeb")}
                       </button>
                     )}
                   </>
@@ -8501,10 +9096,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   <>
                     <div style={{ height: 1, backgroundColor: "var(--border)", margin: "10px 0" }} />
                     <div style={{ fontSize: 11, color: "var(--text-3)", padding: "0 10px 4px", opacity: 0.6 }}>
-                      Project Folder
+                      {t("file.projectFolder")}
                     </div>
                     <div style={{ fontSize: 11, color: "var(--text-2)", padding: "0 10px 6px", opacity: 0.7, wordBreak: "break-all" }}>
-                      {getVaultPath() ?? "Not set"}
+                      {getVaultPath() ?? t("file.notSet")}
                     </div>
                     <button
                       type="button"
@@ -8523,7 +9118,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         marginBottom: 6,
                       }}
                     >
-                      {vaultPickerBusy ? "Opening…" : "Create new project…"}
+                      {vaultPickerBusy ? t("file.opening") : t("file.createProject")}
                     </button>
                     <button
                       type="button"
@@ -8541,7 +9136,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         textAlign: "left",
                       }}
                     >
-                      Switch project…
+                      {t("file.switchProject")}
                     </button>
                   </>
                 )}
@@ -8569,7 +9164,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         textAlign: "left",
                       }}
                     >
-                      Delete project…
+                      {t("file.deleteProject")}
                     </button>
                   </>
                 )}
@@ -8594,7 +9189,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               }}
               title="View"
             >
-              View ▾
+              {t("menu.view")} ▾
             </button>
 
             {viewMenuOpen && (
@@ -8621,8 +9216,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => { setLayoutModalOpen(true); setViewMenuOpen(false); }}
                   style={viewMenuItemStyle}
                 >
-                  <span>Change layout…</span>
-                  <span style={{ opacity: 0.6 }}>{layoutMode === "dual" ? "Dual" : "Focus"}</span>
+                  <span>{t("view.changeLayout")}</span>
+                  <span style={{ opacity: 0.6 }}>{layoutMode === "dual" ? t("view.layout.dual") : t("view.layout.focus")}</span>
                 </button>
 
                 <button
@@ -8630,7 +9225,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => { setShowAssetsTree((v) => !v); setViewMenuOpen(false); }}
                   style={viewMenuItemStyle}
                 >
-                  {showAssetsTree ? "Hide assets in sidebar" : "Show assets in sidebar"}
+                  {showAssetsTree ? t("view.hideAssets") : t("view.showAssets")}
                 </button>
 
                 <button
@@ -8638,7 +9233,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => { setShowDialogueTree((v) => !v); setViewMenuOpen(false); }}
                   style={viewMenuItemStyle}
                 >
-                  {showDialogueTree ? "Hide conditions in sidebar" : "Show conditions in sidebar"}
+                  {showDialogueTree ? t("view.hideConditions") : t("view.showConditions")}
                 </button>
 
                 {/* Theme */}
@@ -8647,7 +9242,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => cycleTheme()}
                   style={viewMenuItemStyle}
                 >
-                  <span>Theme</span>
+                  <span>{t("view.theme")}</span>
                   <span style={{ opacity: 0.7 }}>{themeIcon} {themeLabel}</span>
                 </button>
 
@@ -8671,7 +9266,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               }}
               title="Tools"
             >
-              Tools ▾
+              {t("menu.tools")} ▾
             </button>
 
             {toolsMenuOpen && (
@@ -8697,15 +9292,27 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => { isDesktop ? openTimelineWindow() : setTimelineVisible(true); setToolsMenuOpen(false); }}
                   style={viewMenuItemStyle}
                 >
-                  Open Timeline
+                  {t("tools.openTimeline")}
                 </button>
                 <button
                   type="button"
                   onClick={() => { isDesktop ? openWorldMapWindow() : setWorldMapOpen(true); setToolsMenuOpen(false); }}
                   style={viewMenuItemStyle}
                 >
-                  Open World Map
+                  {t("tools.openWorldMap")}
                 </button>
+                {!isDesktop && (
+                  <>
+                    <div style={{ height: 1, background: "var(--border-3)", margin: "4px 2px" }} />
+                    <button
+                      type="button"
+                      onClick={() => { window.open("https://rpgstorytoolkit.com/#download", "_blank", "noopener,noreferrer"); setToolsMenuOpen(false); }}
+                      style={viewMenuItemStyle}
+                    >
+                      {t("tools.downloadDesktop")}
+                    </button>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -8919,20 +9526,19 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                             }}
                           >
                             <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.name}</span>
+                            {synced && (
+                              <span
+                                title={syncSession ? "Synced to your web account" : "Linked to a web account. Sign in to sync."}
+                                style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, borderRadius: 999, padding: "1px 7px", border: "1px solid var(--accent)", background: "var(--accent-bg-2)", color: "var(--accent-text)" }}
+                              >
+                                {syncSession ? "☁ Synced" : "☁ Linked"}
+                              </span>
+                            )}
                             <span
-                              title={synced ? "Synced to web" : "Local only"}
-                              style={{
-                                flexShrink: 0,
-                                fontSize: 9.5,
-                                fontWeight: 700,
-                                borderRadius: 999,
-                                padding: "1px 7px",
-                                border: "1px solid " + (synced ? "var(--accent)" : "var(--border-3)"),
-                                background: synced ? "var(--accent-bg-2)" : "transparent",
-                                color: synced ? "var(--accent-text)" : "var(--text-dim)",
-                              }}
+                              title="Stored on this device"
+                              style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, borderRadius: 999, padding: "1px 7px", border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-dim)" }}
                             >
-                              {synced ? "☁ Synced" : "Local"}
+                              Local
                             </span>
                           </button>
                         );
@@ -9078,7 +9684,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   height: 34,
                 }}
               >
-                Close
+                {t("common.close")}
               </button>
             </div>
 
@@ -9321,10 +9927,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 type="button"
                 onClick={async () => {
                   const ok = await appModal.confirm({
-                    title: "Log out?",
-                    message: "You'll be returned to the sign-in screen.",
-                    confirmText: "Log out",
-                    cancelText: "Cancel",
+                    title: t("dialog.logoutTitle"),
+                    message: t("dialog.logoutMessage"),
+                    confirmText: t("common.logOut"),
+                    cancelText: t("common.cancel"),
                   });
                   if (ok) logout();
                 }}
@@ -9512,7 +10118,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   fontSize: 13,
                 }}
               >
-                Cancel
+                {t("common.cancel")}
               </button>
 
               <button
@@ -9565,27 +10171,25 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             }}
           >
             <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8, color: "var(--danger-text)" }}>
-              Delete project
+              {t("delproj.title")}
             </div>
 
             <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 10, lineHeight: 1.45 }}>
               {isDesktop ? (
                 <>
-                  This moves the entire project folder to the Trash, including all documents, tables, dialogue and assets.{" "}
-                  {syncMeta ? (
-                    <>The copy on your web account is <b>not</b> deleted{syncSession ? " — delete it from the web app if you want it gone there too" : " — sign in on the web app to delete it there"}. </>
-                  ) : null}
-                  To confirm, type <b>DELETE</b> below.
+                  {t("delproj.desktopIntro")}{" "}
+                  {syncMeta ? <>{t("delproj.syncNote")} </> : null}
+                  {t("delproj.confirmType")}
                 </>
               ) : (
-                <>This permanently deletes this project and all its data. To confirm, type <b>DELETE</b> below.</>
+                <>{t("delproj.webIntro")} {t("delproj.confirmType")}</>
               )}
             </div>
 
             <input
               value={deleteProjectConfirmText}
               onChange={(e) => setDeleteProjectConfirmText(e.target.value)}
-              placeholder='Type "DELETE" to confirm'
+              placeholder={t("delproj.placeholder")}
               disabled={isDeletingProject}
               autoFocus
               style={{
@@ -9617,7 +10221,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   fontSize: 13,
                 }}
               >
-                Cancel
+                {t("common.cancel")}
               </button>
 
               <button
@@ -9635,8 +10239,96 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   fontSize: 13,
                 }}
               >
-                {isDeletingProject ? "Deleting…" : "Delete permanently"}
+                {isDeletingProject ? t("delproj.deleting") : t("delproj.deletePermanently")}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {replaceModalOpen && project && (
+        <div
+          style={{ position: "fixed", inset: 0, backgroundColor: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 16 }}
+          onMouseDown={(e) => { if (e.target === e.currentTarget && !replaceBusy) setReplaceModalOpen(false); }}
+        >
+          <div style={{ width: 560, maxWidth: "100%", backgroundColor: "var(--bg-panel)", border: "1px solid var(--border-2)", borderRadius: 12, padding: 14, boxShadow: "0 12px 30px var(--overlay-2)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{t("replace.title")}</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>{t("replace.desc")}</div>
+              </div>
+              <button type="button" onClick={() => setReplaceModalOpen(false)} disabled={replaceBusy}
+                style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "6px 10px", height: 34 }}>
+                {t("common.close")}
+              </button>
+            </div>
+
+            <div style={{ height: 1, backgroundColor: "var(--border)", margin: "12px 0" }} />
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, opacity: 0.85 }}>
+                {t("replace.find")}
+                <input
+                  value={replaceFind}
+                  onChange={(e) => setReplaceFind(e.target.value)}
+                  placeholder={t("replace.findPh")}
+                  autoFocus
+                  style={{ borderRadius: 8, border: "1px solid var(--border-2)", background: "var(--bg-surface)", color: "var(--text)", padding: "8px 10px", fontSize: 14 }}
+                />
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, opacity: 0.85 }}>
+                {t("replace.with")}
+                <input
+                  value={replaceWith}
+                  onChange={(e) => setReplaceWith(e.target.value)}
+                  placeholder={t("replace.withPh")}
+                  style={{ borderRadius: 8, border: "1px solid var(--border-2)", background: "var(--bg-surface)", color: "var(--text)", padding: "8px 10px", fontSize: 14 }}
+                />
+              </label>
+
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                <input type="checkbox" checked={replaceMatchCase} onChange={(e) => setReplaceMatchCase(e.target.checked)} style={{ accentColor: "var(--accent)" }} />
+                {t("replace.matchCase")}
+              </label>
+
+              <div style={{ display: "flex", gap: 16, fontSize: 13, marginTop: 2 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                  <input type="radio" name="replace-scope" checked={replaceScopeAll} onChange={() => setReplaceScopeAll(true)} style={{ accentColor: "var(--accent)" }} />
+                  {t("replace.scopeAll")}
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                  <input type="radio" name="replace-scope" checked={!replaceScopeAll} onChange={() => setReplaceScopeAll(false)} style={{ accentColor: "var(--accent)" }} />
+                  {t("replace.scopeSelected")}
+                </label>
+              </div>
+
+              {!replaceScopeAll && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 220, overflowY: "auto", border: "1px solid var(--border-2)", borderRadius: 8, padding: 8, background: "var(--bg-surface)" }}>
+                  {project.documents.map((d) => {
+                    const checked = replaceDocIds.includes(d.id);
+                    return (
+                      <label key={d.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 6, cursor: "pointer", background: checked ? "var(--accent-sel)" : "transparent" }}>
+                        <input type="checkbox" checked={checked}
+                          onChange={() => setReplaceDocIds((prev) => prev.includes(d.id) ? prev.filter((id) => id !== d.id) : [...prev, d.id])}
+                          style={{ accentColor: "var(--accent)", width: 14, height: 14, flexShrink: 0 }} />
+                        <span style={{ fontSize: 13 }}>{d.title || t("common.untitled")}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 4 }}>
+                <button type="button" onClick={() => setReplaceModalOpen(false)} disabled={replaceBusy}
+                  style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13 }}>
+                  {t("common.cancel")}
+                </button>
+                <button type="button" onClick={runReplaceAcrossDocuments}
+                  disabled={replaceBusy || !replaceFind || (!replaceScopeAll && replaceDocIds.length === 0)}
+                  style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: (replaceBusy || !replaceFind) ? "var(--bg-elevated)" : "var(--accent-bg)", color: (replaceBusy || !replaceFind) ? "var(--text-dim)" : "var(--text)", cursor: (replaceBusy || !replaceFind) ? "not-allowed" : "pointer", padding: "8px 14px", fontSize: 13 }}>
+                  {replaceBusy ? t("replace.replacing") : t("replace.replace")}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -9671,15 +10363,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
               <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Export condition JSON</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>Choose which conditions to export as engine-readable JSON.</div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{t("file.exportConditionJson")}</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>{t("exp.descConditions")}</div>
               </div>
               <button
                 type="button"
                 onClick={() => setExportDialogueModalOpen(false)}
                 style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "6px 10px", height: 34 }}
               >
-                Close
+                {t("common.close")}
               </button>
             </div>
 
@@ -9688,7 +10380,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <label style={{ fontSize: 12, opacity: 0.85 }}>Conditions</label>
+                  <label style={{ fontSize: 12, opacity: 0.85 }}>{t("nav.conditions")}</label>
                   <button
                     type="button"
                     onClick={() => {
@@ -9697,7 +10389,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     }}
                     style={{ fontSize: 12, background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0 }}
                   >
-                    {exportDatasetIds.length === getDatasets(project).length ? "Deselect all" : "Select all"}
+                    {exportDatasetIds.length === getDatasets(project).length ? t("exp.deselectAll") : t("exp.selectAll")}
                   </button>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 260, overflowY: "auto", border: "1px solid var(--border-2)", borderRadius: 8, padding: 8, background: "var(--bg-surface)" }}>
@@ -9717,7 +10409,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           style={{ accentColor: "var(--accent)", width: 14, height: 14, flexShrink: 0 }}
                         />
                         <span style={{ fontSize: 13, flex: 1 }}>{ds.name}</span>
-                        <span style={{ fontSize: 11, opacity: 0.5 }}>{ds.entries.length} entr{ds.entries.length !== 1 ? "ies" : "y"}</span>
+                        <span style={{ fontSize: 11, opacity: 0.5 }}>{ds.entries.length} {t("exp.entriesLabel")}</span>
                       </label>
                     );
                   })}
@@ -9730,7 +10422,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => setExportDialogueModalOpen(false)}
                   style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13 }}
                 >
-                  Cancel
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="button"
@@ -9741,7 +10433,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   }}
                   style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: exportDatasetIds.length === 0 ? "var(--bg-elevated)" : "var(--accent-bg)", color: exportDatasetIds.length === 0 ? "var(--text-dim)" : "var(--text)", cursor: exportDatasetIds.length === 0 ? "not-allowed" : "pointer", padding: "8px 14px", fontSize: 13, opacity: exportDatasetIds.length === 0 ? 0.6 : 1 }}
                 >
-                  Export {exportDatasetIds.length > 0 ? `(${exportDatasetIds.length})` : ""}
+                  {t("file.export")} {exportDatasetIds.length > 0 ? `(${exportDatasetIds.length})` : ""}
                 </button>
               </div>
             </div>
@@ -9757,10 +10449,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           <div style={{ width: 560, maxWidth: "100%", backgroundColor: "var(--bg-panel)", border: "1px solid var(--border-2)", borderRadius: 12, padding: 14, boxShadow: "0 12px 30px var(--overlay-2)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
               <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Export assets (ZIP)</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>Choose which tables to export attached files from.</div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{t("file.exportAssets")}</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>{t("exp.descAssets")}</div>
               </div>
-              <button type="button" onClick={() => setExportAssetsModalOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "6px 10px", height: 34 }}>Close</button>
+              <button type="button" onClick={() => setExportAssetsModalOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "6px 10px", height: 34 }}>{t("common.close")}</button>
             </div>
 
             <div style={{ height: 1, backgroundColor: "var(--border)", margin: "12px 0" }} />
@@ -9768,7 +10460,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <label style={{ fontSize: 12, opacity: 0.85 }}>Tables</label>
+                  <label style={{ fontSize: 12, opacity: 0.85 }}>{t("exp.tables")}</label>
                   <button
                     type="button"
                     onClick={() => {
@@ -9777,7 +10469,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     }}
                     style={{ fontSize: 12, background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0 }}
                   >
-                    {exportAssetsSelection.length === project.collections.length ? "Deselect all" : "Select all"}
+                    {exportAssetsSelection.length === project.collections.length ? t("exp.deselectAll") : t("exp.selectAll")}
                   </button>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 260, overflowY: "auto", border: "1px solid var(--border-2)", borderRadius: 8, padding: 8, background: "var(--bg-surface)" }}>
@@ -9794,7 +10486,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         />
                         <div style={{ width: 8, height: 8, borderRadius: 999, background: c.color, flexShrink: 0 }} />
                         <span style={{ fontSize: 13, flex: 1 }}>{c.name}</span>
-                        <span style={{ fontSize: 11, opacity: 0.5 }}>{assetCount} file{assetCount !== 1 ? "s" : ""}</span>
+                        <span style={{ fontSize: 11, opacity: 0.5 }}>{assetCount} {t("exp.filesLabel")}</span>
                       </label>
                     );
                   })}
@@ -9802,7 +10494,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               </div>
 
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 4 }}>
-                <button type="button" onClick={() => setExportAssetsModalOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13 }}>Cancel</button>
+                <button type="button" onClick={() => setExportAssetsModalOpen(false)} style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13 }}>{t("common.cancel")}</button>
                 <button
                   type="button"
                   disabled={exportAssetsSelection.length === 0}
@@ -9812,7 +10504,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   }}
                   style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: exportAssetsSelection.length === 0 ? "var(--bg-elevated)" : "var(--accent-bg)", color: exportAssetsSelection.length === 0 ? "var(--text-dim)" : "var(--text)", cursor: exportAssetsSelection.length === 0 ? "not-allowed" : "pointer", padding: "8px 14px", fontSize: 13, opacity: exportAssetsSelection.length === 0 ? 0.6 : 1 }}
                 >
-                  Export {exportAssetsSelection.length > 0 && exportAssetsSelection.length < project.collections.length ? `(${exportAssetsSelection.length})` : ""}
+                  {t("file.export")} {exportAssetsSelection.length > 0 && exportAssetsSelection.length < project.collections.length ? `(${exportAssetsSelection.length})` : ""}
                 </button>
               </div>
             </div>
@@ -9849,15 +10541,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
               <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Export tables</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>Choose which tables to export and in what format.</div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{t("exp.titleTables")}</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>{t("exp.descTables")}</div>
               </div>
               <button
                 type="button"
                 onClick={() => setExportCollectionsModalOpen(false)}
                 style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "6px 10px", height: 34 }}
               >
-                Close
+                {t("common.close")}
               </button>
             </div>
 
@@ -9867,7 +10559,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               {/* Collections checklist */}
               <div>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <label style={{ fontSize: 12, opacity: 0.85 }}>Tables</label>
+                  <label style={{ fontSize: 12, opacity: 0.85 }}>{t("exp.tables")}</label>
                   <button
                     type="button"
                     onClick={() => {
@@ -9878,7 +10570,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     }}
                     style={{ fontSize: 12, background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0 }}
                   >
-                    {exportCollectionsSelection.length === project.collections.length ? "Deselect all" : "Select all"}
+                    {exportCollectionsSelection.length === project.collections.length ? t("exp.deselectAll") : t("exp.selectAll")}
                   </button>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 240, overflowY: "auto", border: "1px solid var(--border-2)", borderRadius: 8, padding: 8, background: "var(--bg-surface)" }}>
@@ -9899,7 +10591,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         />
                         <div style={{ width: 8, height: 8, borderRadius: 999, background: c.color, flexShrink: 0 }} />
                         <span style={{ fontSize: 13, flex: 1 }}>{c.name}</span>
-                        <span style={{ fontSize: 11, opacity: 0.5 }}>{c.rows.length} rows</span>
+                        <span style={{ fontSize: 11, opacity: 0.5 }}>{c.rows.length} {t("exp.rowsLabel")}</span>
                       </label>
                     );
                   })}
@@ -9908,7 +10600,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
               {/* Format picker */}
               <div>
-                <label style={{ fontSize: 12, opacity: 0.85, display: "block", marginBottom: 6 }}>Format</label>
+                <label style={{ fontSize: 12, opacity: 0.85, display: "block", marginBottom: 6 }}>{t("exp.format")}</label>
                 <select
                   className="themed-select"
                   value={exportCollectionsFormat}
@@ -9928,7 +10620,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => setExportCollectionsModalOpen(false)}
                   style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13 }}
                 >
-                  Cancel
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="button"
@@ -9939,7 +10631,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   }}
                   style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: exportCollectionsSelection.length === 0 ? "var(--bg-elevated)" : "var(--accent-bg)", color: exportCollectionsSelection.length === 0 ? "var(--text-dim)" : "var(--text)", cursor: exportCollectionsSelection.length === 0 ? "not-allowed" : "pointer", padding: "8px 14px", fontSize: 13, opacity: exportCollectionsSelection.length === 0 ? 0.6 : 1 }}
                 >
-                  Export {exportCollectionsSelection.length > 0 && exportCollectionsSelection.length < project.collections.length ? `(${exportCollectionsSelection.length})` : ""}
+                  {t("file.export")} {exportCollectionsSelection.length > 0 && exportCollectionsSelection.length < project.collections.length ? `(${exportCollectionsSelection.length})` : ""}
                 </button>
               </div>
             </div>
@@ -9976,15 +10668,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
               <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>Export documents</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>Choose which documents to export and in what format.</div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{t("exp.titleDocuments")}</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>{t("exp.descDocuments")}</div>
               </div>
               <button
                 type="button"
                 onClick={() => setExportDocumentsModalOpen(false)}
                 style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "6px 10px", height: 34 }}
               >
-                Close
+                {t("common.close")}
               </button>
             </div>
 
@@ -9994,7 +10686,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               {/* Documents checklist */}
               <div>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <label style={{ fontSize: 12, opacity: 0.85 }}>Documents</label>
+                  <label style={{ fontSize: 12, opacity: 0.85 }}>{t("nav.documents")}</label>
                   <button
                     type="button"
                     onClick={() => {
@@ -10005,7 +10697,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     }}
                     style={{ fontSize: 12, background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0 }}
                   >
-                    {exportDocumentsSelection.length === project.documents.length ? "Deselect all" : "Select all"}
+                    {exportDocumentsSelection.length === project.documents.length ? t("exp.deselectAll") : t("exp.selectAll")}
                   </button>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 240, overflowY: "auto", border: "1px solid var(--border-2)", borderRadius: 8, padding: 8, background: "var(--bg-surface)" }}>
@@ -10033,7 +10725,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
               {/* Format picker */}
               <div>
-                <label style={{ fontSize: 12, opacity: 0.85, display: "block", marginBottom: 6 }}>Format</label>
+                <label style={{ fontSize: 12, opacity: 0.85, display: "block", marginBottom: 6 }}>{t("exp.format")}</label>
                 <select
                   className="themed-select"
                   value={exportDocumentsFormat}
@@ -10053,7 +10745,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   onClick={() => setExportDocumentsModalOpen(false)}
                   style={{ borderRadius: 8, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "8px 10px", fontSize: 13 }}
                 >
-                  Cancel
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="button"
@@ -10064,7 +10756,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   }}
                   style={{ borderRadius: 8, border: "1px solid var(--accent)", backgroundColor: exportDocumentsSelection.length === 0 ? "var(--bg-elevated)" : "var(--accent-bg)", color: exportDocumentsSelection.length === 0 ? "var(--text-dim)" : "var(--text)", cursor: exportDocumentsSelection.length === 0 ? "not-allowed" : "pointer", padding: "8px 14px", fontSize: 13, opacity: exportDocumentsSelection.length === 0 ? 0.6 : 1 }}
                 >
-                  Export {exportDocumentsSelection.length > 0 && exportDocumentsSelection.length < project.documents.length ? `(${exportDocumentsSelection.length})` : ""}
+                  {t("file.export")} {exportDocumentsSelection.length > 0 && exportDocumentsSelection.length < project.documents.length ? `(${exportDocumentsSelection.length})` : ""}
                 </button>
               </div>
             </div>
@@ -10074,14 +10766,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
       {wikiModalOpen && project && (
         <Modal
-          title={project.view?.wiki?.published ? "Wiki settings" : "Publish as a wiki"}
+          title={project.view?.wiki?.published ? t("wiki.titlePublished") : t("wiki.titleUnpublished")}
           width={920}
           onClose={() => setWikiModalOpen(false)}
         >
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 12 }}>
               <div>
-                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 6 }}>Public URL</div>
+                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 6 }}>{t("wiki.publicUrl")}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                   <div style={{ fontSize: 12, opacity: 0.75 }}>app.rpgstorytoolkit.com/</div>
                   <input
@@ -10117,21 +10809,21 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       padding: "8px 10px",
                       fontSize: 13,
                     }}
-                    title="Use project name (auto-updating URL)"
+                    title={t("wiki.useProjectNameTitle")}
                   >
-                    Use project name
+                    {t("wiki.useProjectName")}
                   </button>
                 </div>
                 <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                  If the URL is already taken, “-1”, “-2”, etc. will be appended.
+                  {t("wiki.slugTaken")}
                 </div>
                 <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-                  Auto-update on rename: <b>{wikiDraftSlugOverride ? "Off" : "On"}</b>
+                  {t("wiki.autoUpdate")} <b>{wikiDraftSlugOverride ? t("common.off") : t("common.on")}</b>
                 </div>
               </div>
 
               <div>
-                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 6 }}>Home page</div>
+                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 6 }}>{t("wiki.homePage")}</div>
                 <select className="themed-select"
                   value={wikiDraftHomeDocId}
                   onChange={(e) => setWikiDraftHomeDocId(e.target.value)}
@@ -10154,21 +10846,21 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     ))}
                 </select>
                 {wikiDraftDocIds.length === 0 && (
-                  <div style={{ fontSize: 12, color: "var(--error-text)", marginTop: 6 }}>Select at least one page.</div>
+                  <div style={{ fontSize: 12, color: "var(--error-text)", marginTop: 6 }}>{t("wiki.selectOnePage")}</div>
                 )}
               </div>
             </div>
 
             {/* ✅ SEO / Search settings + preview */}
             <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 10, background: "var(--bg-surface)" }}>
-              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Search engine settings</div>
+              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>{t("wiki.seoSettings")}</div>
 
               <div style={{ display: "grid", gridTemplateColumns: "1.15fr 0.85fr", gap: 12, alignItems: "start" }}>
                 {/* Left: fields */}
                 <div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                     <div>
-                      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Title (search result)</div>
+                      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>{t("wiki.seoTitle")}</div>
                       <input
                         value={wikiDraftSeoTitle}
                         onChange={(e) => setWikiDraftSeoTitle(e.target.value)}
@@ -10186,7 +10878,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     </div>
 
                     <div>
-                      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>OG image URL (optional)</div>
+                      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>{t("wiki.ogImage")}</div>
                       <input
                         value={wikiDraftSeoImageUrl}
                         onChange={(e) => setWikiDraftSeoImageUrl(e.target.value)}
@@ -10205,11 +10897,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   </div>
 
                   <div style={{ marginTop: 10 }}>
-                    <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Description</div>
+                    <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>{t("common.description")}</div>
                     <textarea
                       value={wikiDraftSeoDescription}
                       onChange={(e) => setWikiDraftSeoDescription(e.target.value)}
-                      placeholder="A short description shown in search results."
+                      placeholder={t("wiki.descPlaceholder")}
                       rows={3}
                       style={{
                         width: "100%",
@@ -10231,12 +10923,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       checked={wikiDraftAllowIndexing}
                       onChange={(e) => setWikiDraftAllowIndexing(e.target.checked)}
                     />
-                    Allow search engines to index this wiki
+                    {t("wiki.allowIndex")}
                   </label>
 
                   {!wikiDraftAllowIndexing && (
                     <div style={{ fontSize: 12, color: "var(--danger-text)", marginTop: 6 }}>
-                      Search engines will be asked not to index (noindex/nofollow).
+                      {t("wiki.noindexNote")}
                     </div>
                   )}
                 </div>
@@ -10244,16 +10936,16 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 {/* Right: preview */}
                 <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 10, background: "var(--bg-deep)" }}>
                   <div style={{ fontSize: 12, opacity: 0.85, fontWeight: 800, marginBottom: 8 }}>
-                    Search result preview
+                    {t("wiki.previewTitle")}
                   </div>
 
                   {(() => {
                     const slug = (wikiDraftSlug || slugFromProjectName(project.name)).trim() || "your-wiki";
                     const url = `app.rpgstorytoolkit.com/${slug}`;
-                    const title = (wikiDraftSeoTitle || project.name || "Story Wiki").trim() || "Story Wiki";
+                    const title = (wikiDraftSeoTitle || project.name || t("wiki.defaultTitle")).trim() || t("wiki.defaultTitle");
                     const desc =
-                      (wikiDraftSeoDescription || "Public wiki for this story project.").trim() ||
-                      "Public wiki for this story project.";
+                      (wikiDraftSeoDescription || t("wiki.defaultDesc")).trim() ||
+                      t("wiki.defaultDesc");
 
                     return (
                       <div style={{ padding: 10, borderRadius: 10, border: "1px solid var(--bg-dark)", background: "var(--bg-deep)" }}>
@@ -10271,7 +10963,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   })()}
 
                   <div style={{ fontSize: 11, opacity: 0.65, marginTop: 8, lineHeight: 1.35 }}>
-                    Preview is an approximation; Google may rewrite titles/descriptions.
+                    {t("wiki.previewNote")}
                   </div>
                 </div>
               </div>
@@ -10279,7 +10971,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
               <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 10, background: "var(--bg-surface)" }}>
-                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Pages</div>
+                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>{t("wiki.pages")}</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 260, overflow: "auto" }}>
                   {project.documents.map((d) => (
                     <label key={d.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
@@ -10308,7 +11000,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               </div>
 
               <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 10, background: "var(--bg-surface)" }}>
-                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>Tables</div>
+                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>{t("exp.tables")}</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 260, overflow: "auto" }}>
                   {project.collections.map((c) => (
                     <label key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
@@ -10331,14 +11023,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
             {project.view?.worldMapImagePath && (
               <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 10, background: "var(--bg-surface)" }}>
-                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>World Map</div>
+                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 8 }}>{t("term.worldMap")}</div>
                 <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
                   <input
                     type="checkbox"
                     checked={project.view?.worldMapIncludeInWiki ?? false}
                     onChange={(e) => setWorldMapIncludeInWiki(e.target.checked)}
                   />
-                  Include World Map in public wiki
+                  {t("wiki.includeWorldMap")}
                 </label>
               </div>
             )}
@@ -10349,10 +11041,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   type="button"
                   onClick={async () => {
                     const ok = await appModal.confirm({
-                      title: "Unpublish wiki?",
-                      message: "Your wiki will no longer be publicly accessible. You can re-publish it at any time.",
-                      confirmText: "Unpublish",
-                      cancelText: "Cancel",
+                      title: t("wiki.unpublishTitle"),
+                      message: t("wiki.unpublishMsg"),
+                      confirmText: t("wiki.unpublish"),
+                      cancelText: t("common.cancel"),
                       danger: true,
                     });
                     if (!ok) return;
@@ -10371,7 +11063,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     marginRight: "auto",
                   }}
                 >
-                  Unpublish
+                  {t("wiki.unpublish")}
                 </button>
               )}
 
@@ -10406,7 +11098,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   fontSize: 13,
                 }}
               >
-                {wikiBusy ? "Working…" : project.view?.wiki?.published ? "Save" : "Publish"}
+                {wikiBusy ? t("file.working") : project.view?.wiki?.published ? t("common.save") : t("wiki.publish")}
               </button>
             </div>
 
@@ -10421,21 +11113,21 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       )}
 
       {layoutModalOpen && (
-        <Modal title="Change layout" width={620} onClose={() => setLayoutModalOpen(false)}>
+        <Modal title={t("layout.title")} width={620} onClose={() => setLayoutModalOpen(false)}>
           <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 14 }}>
-            Choose how the workspace is arranged. You can switch any time.
+            {t("layout.subtitle")}
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             {([
-              { mode: "focus" as const, title: "Focus", desc: "Sidebar + one editor at a time. Click a document or table to view it." },
-              { mode: "dual" as const, title: "Dual", desc: "Sidebar with the story editor and table editor side by side." },
+              { mode: "focus" as const, title: t("view.layout.focus"), desc: t("layout.focusDesc") },
+              { mode: "dual" as const, title: t("view.layout.dual"), desc: t("layout.dualDesc") },
             ]).map((opt) => {
               const active = layoutMode === opt.mode;
               return (
                 <button
                   key={opt.mode}
                   type="button"
-                  onClick={() => { setLayoutMode(opt.mode); setPanelSizes([]); setLayoutModalOpen(false); }}
+                  onClick={() => { setLayoutMode(opt.mode); setPanelSizes([]); }}
                   style={{
                     textAlign: "left",
                     border: active ? "2px solid var(--accent)" : "1px solid var(--border-2)",
@@ -10462,12 +11154,87 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span style={{ fontWeight: 800, fontSize: 14 }}>{opt.title}</span>
-                    {active && <span style={{ fontSize: 11, color: "var(--accent-text)", fontWeight: 700 }}>Current</span>}
+                    {active && <span style={{ fontSize: 11, color: "var(--accent-text)", fontWeight: 700 }}>{t("common.current")}</span>}
                   </div>
                   <div style={{ fontSize: 12, opacity: 0.7, lineHeight: 1.4 }}>{opt.desc}</div>
                 </button>
               );
             })}
+          </div>
+
+          {/* Dual-view side panel (web only): host the Timeline or World Map on one side. */}
+          {layoutMode === "dual" && !isDesktop && (
+            <div style={{ marginTop: 18, paddingTop: 16, borderTop: "1px solid var(--border-2)" }}>
+              <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 4 }}>{t("layout.sidePanel")}</div>
+              <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 12 }}>
+                {t("layout.sidePanelDesc")}
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {([
+                  { val: null, label: t("common.none") },
+                  { val: "timeline" as const, label: t("term.timeline") },
+                  { val: "worldmap" as const, label: t("term.worldMap") },
+                ]).map((opt) => {
+                  const sel = (dualTool ?? null) === opt.val;
+                  return (
+                    <button
+                      key={String(opt.val)}
+                      type="button"
+                      onClick={() => setDualTool(opt.val)}
+                      style={{
+                        border: sel ? "2px solid var(--accent)" : "1px solid var(--border-2)",
+                        background: sel ? "var(--bg-row-sel)" : "var(--bg-surface)",
+                        color: "var(--text)",
+                        borderRadius: 8,
+                        padding: "8px 14px",
+                        cursor: "pointer",
+                        fontSize: 13,
+                        fontWeight: 600,
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {dualTool && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 14 }}>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>{t("layout.side")}</span>
+                  {([
+                    { val: "left" as const, label: t("common.left") },
+                    { val: "right" as const, label: t("common.right") },
+                  ]).map((opt) => {
+                    const sel = dualToolSide === opt.val;
+                    return (
+                      <button
+                        key={opt.val}
+                        type="button"
+                        onClick={() => setDualToolSide(opt.val)}
+                        style={{
+                          border: sel ? "2px solid var(--accent)" : "1px solid var(--border-2)",
+                          background: sel ? "var(--bg-row-sel)" : "var(--bg-surface)",
+                          color: "var(--text)",
+                          borderRadius: 8,
+                          padding: "6px 14px",
+                          cursor: "pointer",
+                          fontSize: 13,
+                          fontWeight: 600,
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+            <button type="button" className="toolBtn" onClick={() => setLayoutModalOpen(false)} style={{ padding: "8px 18px", fontWeight: 700 }}>
+              {t("common.done")}
+            </button>
           </div>
         </Modal>
       )}
@@ -10485,7 +11252,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             return (
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 <div style={{ fontWeight: 900, fontSize: 14 }}>
-                  Assets — {col.name} / {getRowLabel(row) || row.id}
+                  {t("nav.assets")}: {col.name} / {getRowLabel(row) || row.id}
                 </div>
 
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -10499,7 +11266,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         await addAssetsToEntity(col.id, row.id, e.target.files);
                         e.currentTarget.value = ""; // allow re-upload same file
                         if (count > 0) {
-                          setAssetUploadMsg(`Uploaded ${count} file${count > 1 ? "s" : ""} ✓`);
+                          setAssetUploadMsg(`${t("asset.uploaded")} ${count} ${t("exp.filesLabel")} ✓`);
                           window.setTimeout(() => setAssetUploadMsg(null), 2500);
                         }
                       }}
@@ -10508,13 +11275,13 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
                   <div style={{ fontSize: 12, opacity: 0.75 }}>
                     {uploadingCount > 0
-                      ? `Uploading ${uploadingCount} file${uploadingCount > 1 ? "s" : ""}…`
+                      ? `${t("asset.uploading")} ${uploadingCount} ${t("exp.filesLabel")}…`
                       : (assetUploadMsg ?? "")}
                   </div>
                 </div>
 
                 {assets.length === 0 ? (
-                  <div style={{ opacity: 0.75, fontSize: 13 }}>No assets uploaded for this record.</div>
+                  <div style={{ opacity: 0.75, fontSize: 13 }}>{t("asset.noAssetsUploaded")}</div>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 2, border: "1px solid var(--border-2)", borderRadius: 10, padding: 6 }}>
                     {assets.map((a) => {
@@ -10571,9 +11338,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         <div style={{ flex: 1, minHeight: 0 }}>
           <PanelGroup
             ref={panelGroupRef}
-            key={layoutMode}
+            key={`${layoutMode}:${dualToolActive ? `${dualTool}-${dualToolSide}` : ""}`}
             direction="horizontal"
-            onLayout={(sizes) => setPanelSizes(sizes)}
+            onLayout={(sizes) => { if (!dualToolActive) setPanelSizes(sizes); }}
           >
             {/* LEFT */}
             {showLeftPanel && (
@@ -10592,7 +11359,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   >
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                        <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>Documents</div>
+                        <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>{t("nav.documents")}</div>
 
                         <span
                           className="infoIcon"
@@ -10619,7 +11386,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                               ? isGuest
                                 ? `Create a free account to add more than ${FREE_DOC_LIMIT} documents`
                                 : `Free plan is limited to ${FREE_DOC_LIMIT} documents — upgrade to Pro for more`
-                              : "New document"
+                              : t("side.newDocument")
                           }
                           style={{ opacity: atFreeDocLimit ? 0.5 : 1, cursor: atFreeDocLimit ? "not-allowed" : "pointer" }}
                         >
@@ -10629,7 +11396,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           type="button"
                           className="iconBtn"
                           onClick={() => addFolder("doc", [])}
-                          title="New folder"
+                          title={t("side.newFolder")}
                         >
                           <IconNewFolder />
                         </button>
@@ -10674,7 +11441,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                               <span style={{ fontSize: 11, opacity: 0.5, flexShrink: 0 }}>{row.count}</span>
                               <button
                                 type="button"
-                                title="New document in this folder"
+                                title={t("side.newDocInFolder")}
                                 onClick={(e) => { e.stopPropagation(); addDocument(row.path); }}
                                 style={{ border: "none", background: "transparent", color: "var(--text-3)", cursor: "pointer", fontSize: 15, lineHeight: 1, padding: "0 4px", flexShrink: 0 }}
                               >
@@ -10684,7 +11451,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           );
                         }
                         const d = row.doc;
-                        const selected = d.id === activeDocId && showMiddlePanel;
+                        const selected = d.id === activeDocId && showMiddlePanel && !showRecordPage;
                         return (
                           <TreeRow
                             key={d.id}
@@ -10694,6 +11461,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                               if (handleTreeRowClick(e, "doc", "docitem:" + d.id)) return;
                               setActiveDocId(d.id);
                               setFocusView("doc");
+                              setRecordPage(null); // selecting a document returns from a record page
                             }}
                             onContextMenu={(e) => { e.preventDefault(); setTreeCtxMenu({ x: e.clientX, y: e.clientY, kind: "doc", targetType: "item", id: d.id }); }}
                             style={{
@@ -10718,8 +11486,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                               <button type="button" className="kebabBtn" onClick={(e) => { e.stopPropagation(); setOpenDocMenuId((cur) => (cur === d.id ? null : d.id)); }} title="Actions">⋯</button>
                               {openDocMenuId === d.id && (
                                 <div className="kebabMenu">
-                                  <button type="button" className="kebabMenuItem" onClick={(e) => { e.stopPropagation(); setOpenDocMenuId(null); renameDocument(d.id); }}>Rename</button>
-                                  <button type="button" className="kebabMenuItem kebabMenuItemDanger" onClick={(e) => { e.stopPropagation(); setOpenDocMenuId(null); deleteDocument(d.id); }}>Delete</button>
+                                  <button type="button" className="kebabMenuItem" onClick={(e) => { e.stopPropagation(); setOpenDocMenuId(null); renameDocument(d.id); }}>{t("common.rename")}</button>
+                                  <button type="button" className="kebabMenuItem kebabMenuItemDanger" onClick={(e) => { e.stopPropagation(); setOpenDocMenuId(null); deleteDocument(d.id); }}>{t("common.delete")}</button>
                                 </div>
                               )}
                             </div>
@@ -10741,7 +11509,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                        <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>Database</div>
+                        <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>{t("nav.database")}</div>
 
                         <span
                           className="infoIcon"
@@ -10762,7 +11530,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           type="button"
                           className="iconBtn"
                           onClick={() => addCollection()}
-                          title="New table"
+                          title={t("side.newTable")}
                         >
                           <IconNewCollection />
                         </button>
@@ -10815,7 +11583,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                               <span style={{ fontSize: 11, opacity: 0.5, flexShrink: 0 }}>{row.count}</span>
                               <button
                                 type="button"
-                                title="New table in this folder"
+                                title={t("side.newTableInFolder")}
                                 onClick={(e) => { e.stopPropagation(); addCollection(row.path); }}
                                 style={{ border: "none", background: "transparent", color: "var(--text-3)", cursor: "pointer", fontSize: 15, lineHeight: 1, padding: "0 4px", flexShrink: 0 }}
                               >
@@ -10859,8 +11627,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                               <button type="button" className="kebabBtn" onClick={(e) => { e.stopPropagation(); setOpenColMenuId((cur) => (cur === c.id ? null : c.id)); }} title="Actions">⋯</button>
                               {openColMenuId === c.id && (
                                 <div className="kebabMenu">
-                                  <button type="button" className="kebabMenuItem" onClick={(e) => { e.stopPropagation(); setOpenColMenuId(null); renameCollection(c.id); }}>Rename</button>
-                                  <button type="button" className="kebabMenuItem kebabMenuItemDanger" onClick={(e) => { e.stopPropagation(); setOpenColMenuId(null); deleteCollection(c.id); }}>Delete</button>
+                                  <button type="button" className="kebabMenuItem" onClick={(e) => { e.stopPropagation(); setOpenColMenuId(null); renameCollection(c.id); }}>{t("common.rename")}</button>
+                                  <button type="button" className="kebabMenuItem kebabMenuItemDanger" onClick={(e) => { e.stopPropagation(); setOpenColMenuId(null); deleteCollection(c.id); }}>{t("common.delete")}</button>
                                 </div>
                               )}
                             </div>
@@ -10883,7 +11651,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         <div style={{ height: 1, background: "var(--border)", margin: "14px 0" }} />
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                            <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>Assets</div>
+                            <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>{t("nav.assets")}</div>
                             <span className="infoIcon" tabIndex={0} role="button" aria-label="About assets">
                               i
                               <span className="infoTooltip" role="tooltip">
@@ -10937,8 +11705,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                             const a = row.asset;
                             return (
                               <div key={a.id} className="treeRow"
+                                onClick={() => openAssetPreview(row.colId, row.rowId, a.id)}
                                 onContextMenu={(e) => { e.preventDefault(); setAssetCtxMenu({ kind: "asset", colId: row.colId, rowId: row.rowId, assetId: a.id, x: e.clientX, y: e.clientY }); }}
-                                style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 44, paddingRight: 6, height: 26, borderRadius: 6 }}>
+                                title="Open"
+                                style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 44, paddingRight: 6, height: 26, borderRadius: 6, cursor: "pointer" }}>
                                 <span style={{ flexShrink: 0, display: "flex" }}><AssetTypeBadge name={a.name} mime={a.mime} /></span>
                                 <span style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0, opacity: 0.85 }}>{a.name}</span>
                                 <div className="kebabWrap" data-assetkebab>
@@ -10957,11 +11727,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         <div style={{ height: 1, background: "var(--border)", margin: "14px 0" }} />
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                            <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>Conditions</div>
+                            <div style={{ fontWeight: 800, fontSize: 12, opacity: 0.85 }}>{t("nav.conditions")}</div>
                             <span className="infoIcon" tabIndex={0} role="button" aria-label="About conditions">
                               i
                               <span className="infoTooltip" role="tooltip">
-                                Create conditions to give an output result. Click one to edit it.
+                                Create conditions to give an output result. Especially useful for game developers: map your fields to a dialogue line, a value, or a record's column that your engine reads. Click one to edit it.
                               </span>
                             </span>
                           </div>
@@ -11030,12 +11800,20 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
               </>
             )}
 
+            {/* DUAL TOOL (left side) */}
+            {dualToolActive && dualToolSide === "left" && (
+              <>
+                {renderDualToolPanel()}
+                <PanelResizeHandle className="resize-handle" />
+              </>
+            )}
+
             {/* MIDDLE */}
             {showMiddlePanel && (
               <Panel
                 id="middle-panel"
-                order={2}
-                defaultSize={panelSizes[1] ?? (layoutMode === "dual" ? 40 : 80)}
+                order={dualToolActive && dualToolSide === "left" ? 3 : 2}
+                defaultSize={dualToolActive ? 56 : (panelSizes[1] ?? (layoutMode === "dual" ? 40 : 80))}
                 minSize={30}
               >
                 <div
@@ -11051,23 +11829,33 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <div style={{ fontWeight: 800, fontSize: 14 }}>
-                        {activeDoc ? activeDoc.title : "No document selected"}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                      {showRecordPage && (
+                        <button
+                          type="button"
+                          className="iconBtn"
+                          onClick={closeRecordPage}
+                          title="Close page"
+                          style={{ flexShrink: 0 }}
+                        >
+                          ←
+                        </button>
+                      )}
+                      <div style={{ fontWeight: 800, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {showRecordPage
+                          ? `${recordPageCollection?.name ?? "Record"} · ${getRowLabel(recordPageRow!) || recordPageRow!.id}`
+                          : activeDoc ? activeDoc.title : t("tbl.noDoc")}
                       </div>
 
-                      <span
-                        className="infoIcon"
-                        tabIndex={0}
-                        role="button"
-                        aria-label="How linking works"
-                      >
-                        i
-                        <span className="infoTooltip" role="tooltip">
-                          Link text to a record by highlighting words, then choosing a table/record. You can also type
-                          “/” in the editor to add a record quickly, or quotation marks to link to a dialogue line.
+                      {!showRecordPage && (
+                        <span className="infoIcon" tabIndex={0} role="button" aria-label="How linking works">
+                          i
+                          <span className="infoTooltip" role="tooltip">
+                            Link text to a record by highlighting words, then choosing a table/record. You can also type
+                            “/” in the editor to add a record quickly.
+                          </span>
                         </span>
-                      </span>
+                      )}
                     </div>
                   </div>
 
@@ -11193,6 +11981,133 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     )}
 
                   {/* Editor (now sits UNDER the link panel) — fills the panel height */}
+                  {showRecordPage ? (
+                    <div style={{ flex: "1 1 auto", minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
+                      {(() => {
+                        const cid = recordPage!.collectionId;
+                        const rid = recordPage!.rowId;
+                        const assets = recordPageRow!.assets ?? [];
+                        const assetsOn = recordPageCollection?.assetsEnabled !== false;
+                        const profile = assets.find((a) => a.id === recordPageRow!.profileAssetId);
+                        const profileUrl = profile && (profile.mime || "").startsWith("image/") ? assetUrlCache[profile.path] : null;
+                        const propFields = (recordPageCollection?.schema ?? []).filter((f) => f.id !== "description" && f.id !== "name");
+                        return (
+                          <>
+                            {/* Title: big editable Name (falls back to ID) + icon */}
+                            <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <input
+                                  value={String(recordPageRow!.values["name"] ?? "")}
+                                  onChange={(e) => updateCollectionCell(cid, rid, "name", e.target.value)}
+                                  placeholder={String(recordPageRow!.values["id"] ?? "Untitled")}
+                                  style={{ width: "100%", border: "none", background: "transparent", color: "var(--text)", fontSize: 28, fontWeight: 800, padding: 0, outline: "none", fontFamily: "inherit" }}
+                                />
+                                <div style={{ fontSize: 12, opacity: 0.6, marginTop: 2 }}>{recordPageCollection?.name}</div>
+                              </div>
+                              {assetsOn && (
+                                <button type="button"
+                                  onClick={() => { if (profile) openAssetPreview(cid, rid, profile.id); else openAssetsForEntity(cid, rid); }}
+                                  title={profile ? "Open icon" : "Add an icon"}
+                                  style={{ flexShrink: 0, width: 88, height: 88, borderRadius: 12, border: "1px solid var(--border-2)", background: "var(--bg-panel)", overflow: "hidden", cursor: "pointer", display: "grid", placeItems: "center", padding: 0 }}>
+                                  {profileUrl
+                                    ? <img src={profileUrl} alt="" onError={() => profile && getSignedAssetUrl(profile.path)} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                                    : <span style={{ fontSize: 28, opacity: 0.35 }}>🖼️</span>}
+                                </button>
+                              )}
+                            </div>
+
+                            {/* Properties */}
+                            {propFields.length > 0 && (
+                              <div style={{ border: "1px solid var(--border-2)", borderRadius: 10, background: "var(--bg-surface)", padding: 12 }}>
+                                <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-dim)", marginBottom: 10 }}>{t("rec.properties")}</div>
+                                <div style={{ display: "grid", gridTemplateColumns: "minmax(90px, 140px) 1fr", gap: "8px 12px", alignItems: "center" }}>
+                                  {propFields.map((f) => {
+                                    const raw = recordPageRow!.values[f.id];
+                                    return (
+                                      <React.Fragment key={f.id}>
+                                        <label style={{ fontSize: 12, color: "var(--text-2)", fontWeight: 600 }}>{f.label}</label>
+                                        {f.type === "bool" ? (
+                                          <input type="checkbox" checked={raw === "true" || raw === 1}
+                                            onChange={(e) => updateCollectionCell(cid, rid, f.id, e.target.checked ? "true" : "false")}
+                                            style={{ width: 16, height: 16, justifySelf: "start" }} />
+                                        ) : f.type === "text" ? (
+                                          <textarea value={String(raw ?? "")} rows={2}
+                                            onChange={(e) => updateCollectionCell(cid, rid, f.id, e.target.value)}
+                                            style={{ width: "100%", borderRadius: 6, border: "1px solid var(--border-2)", background: "var(--bg-panel)", color: "var(--text)", padding: "6px 8px", fontSize: 13, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box" }} />
+                                        ) : (
+                                          <input type={f.type === "number" ? "number" : "text"} value={String(raw ?? "")}
+                                            onChange={(e) => updateCollectionCell(cid, rid, f.id, e.target.value)}
+                                            style={{ width: "100%", borderRadius: 6, border: "1px solid var(--border-2)", background: "var(--bg-panel)", color: "var(--text)", padding: "6px 8px", fontSize: 13, boxSizing: "border-box" }} />
+                                        )}
+                                      </React.Fragment>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Assets carousel */}
+                            {assetsOn && (
+                              <div>
+                                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-dim)" }}>{t("nav.assets")}</div>
+                                  <button type="button" className="toolBtn" style={{ fontSize: 12 }} onClick={() => openAssetsForEntity(cid, rid)} title={t("rec.editAssetsTitle")}>{t("rec.editAssets")}</button>
+                                </div>
+                                {assets.length === 0 ? (
+                                  <div style={{ fontSize: 12, opacity: 0.55 }}>{t("rec.noAssets")}</div>
+                                ) : (
+                                  <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 4 }}>
+                                    {assets.map((a) => {
+                                      const isImg = (a.mime || "").startsWith("image/");
+                                      const u = isImg ? assetUrlCache[a.path] : null;
+                                      return (
+                                        <button key={a.id} type="button"
+                                          onClick={() => openAssetPreview(cid, rid, a.id)}
+                                          onContextMenu={(e) => { e.preventDefault(); setAssetCtxMenu({ kind: "asset", colId: cid, rowId: rid, assetId: a.id, x: e.clientX, y: e.clientY }); }}
+                                          title={a.name}
+                                          style={{ flexShrink: 0, width: 116, borderRadius: 10, border: "1px solid var(--border-2)", background: "var(--bg-panel)", cursor: "pointer", padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+                                          <div style={{ width: "100%", height: 86, display: "grid", placeItems: "center", position: "relative", background: u ? `var(--bg-deep, var(--bg-surface)) center/cover no-repeat url("${u}")` : "var(--bg-deep, var(--bg-surface))" }}>
+                                            {!u && <AssetTypeBadge name={a.name} mime={a.mime} size={11} />}
+                                            {a.id === recordPageRow!.profileAssetId && <span style={{ position: "absolute", top: 4, left: 4, fontSize: 9, fontWeight: 700, background: "var(--accent-bg-2)", color: "var(--accent-text)", border: "1px solid var(--accent)", borderRadius: 999, padding: "0 5px" }}>icon</span>}
+                                          </div>
+                                          <div style={{ fontSize: 11, padding: "5px 6px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-2)" }}>{a.name}</div>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
+
+                      {/* Description (rich) */}
+                      {recordPageCollection?.descriptionEnabled !== false && (<>
+                      <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-dim)" }}>{t("common.description")}</div>
+                      <div style={{ flex: "1 1 auto", minHeight: 220, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+                        <StoryEditor
+                          docKey={`rec:${recordPage!.collectionId}:${recordPage!.rowId}`}
+                          value={String(recordPageRow!.values["description"] ?? "")}
+                          richValue={recordPageRow!.descriptionRich ?? ""}
+                          onChange={(text) => patchRow(recordPage!.collectionId, recordPage!.rowId, { values: { description: text } })}
+                          onRichChange={(json) => patchRow(recordPage!.collectionId, recordPage!.rowId, { descriptionRich: json })}
+                          onSelectionChange={handleEditorSelectionChange}
+                          onCaretLinkChange={handleCaretLinkChange}
+                          entityLinks={recordPageRow!.descriptionLinks ?? []}
+                          getCollectionColor={getCollectionColor}
+                          onHighlightClick={handleHighlightClick}
+                          onLinksChange={(links) => updateRecordDescriptionLinks(recordPage!.collectionId, recordPage!.rowId, links)}
+                          linkApiRef={linkApiRef}
+                          slashItems={slashItems}
+                          onSlashLinkCreate={handleSlashLinkCreate}
+                          enableSlashLinking={true}
+                          enableDialogueQuoteLinking={false}
+                        />
+                      </div>
+                      </>)}
+                    </div>
+                  ) : (
                   <div
                     style={{
                       flex: "1 1 auto",
@@ -11219,6 +12134,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                       enableDialogueQuoteLinking={false}
                     />
                   </div>
+                  )}
                 </div>
               </Panel>
             )}
@@ -11228,7 +12144,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
             {/* RIGHT */}
             {showRightPanel && (
-              <Panel id="right-panel" order={3} defaultSize={panelSizes[2] ?? (layoutMode === "dual" ? 40 : 80)} minSize={20}>
+              <Panel id="right-panel" order={dualToolActive && dualToolSide === "left" ? 4 : 3} defaultSize={dualToolActive ? 56 : (panelSizes[2] ?? (layoutMode === "dual" ? 40 : 80))} minSize={24}>
                 {rightShowsDataset ? (
                   activeDataset ? (
                     <DatasetView
@@ -11241,14 +12157,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     />
                   ) : (
                     <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.6, fontSize: 13 }}>
-                      No dataset selected.
+                      {t("tbl.noDataset")}
                     </div>
                   )
                 ) : (
                 <div style={{ height: "100%", padding: "12px 16px", boxSizing: "border-box", overflow: "auto" }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
                     <div style={{ fontWeight: 800, fontSize: 14 }}>
-                      {activeCollection ? activeCollection.name : "No table selected"}
+                      {activeCollection ? activeCollection.name : t("tbl.noTable")}
                     </div>
 
                     {activeCollection && (
@@ -11266,12 +12182,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                       <button type="button" className="toolBtn" onClick={addFieldToActiveCollection} title="Add a column to this table">
                         <IconAddColumn />
-                        Column
+                        {t("tbl.column")}
                       </button>
 
                       <button type="button" className="toolBtn" onClick={addRowToActiveCollection} title="Add a row to this table">
                         <IconAddRow />
-                        Row
+                        {t("tbl.row")}
                       </button>
 
                       <select className="themed-select"
@@ -11298,13 +12214,27 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                           outline: "none",
                         }}
                       >
-                        <option value="enabled">Assets: Enabled</option>
-                        <option value="disabled">Assets: Disabled</option>
+                        <option value="enabled">{t("tbl.assetsShown")}</option>
+                        <option value="disabled">{t("tbl.assetsHidden")}</option>
+                      </select>
+
+                      <select className="themed-select"
+                        value={activeCollection.descriptionEnabled !== false ? "enabled" : "disabled"}
+                        onChange={(e) => {
+                          const shouldEnable = e.target.value === "enabled";
+                          const isEnabled = activeCollection.descriptionEnabled !== false;
+                          if (shouldEnable !== isEnabled) toggleCollectionDescriptionEnabled(activeCollection.id);
+                        }}
+                        title="Show or hide the Description column/page body for this table"
+                        style={{ height: 32, borderRadius: 6, border: "1px solid var(--border-3)", backgroundColor: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "0 34px 0 10px", fontSize: 12, fontWeight: 600, fontFamily: "inherit", outline: "none" }}
+                      >
+                        <option value="enabled">{t("tbl.descShown")}</option>
+                        <option value="disabled">{t("tbl.descHidden")}</option>
                       </select>
                     </div>
                   ) : (
                     <div style={{ marginTop: 12, opacity: 0.7, fontSize: 12 }}>
-                      Select a table to edit it.
+                      {t("tbl.selectTable")}
                     </div>
                   )}
 
@@ -11355,7 +12285,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                 </th>
                               )}
 
-                              {activeCollection.schema.map((f) => (
+                              {activeCollection.schema.filter((f) => f.id !== "description" || activeCollection.descriptionEnabled !== false).map((f) => (
                                 <th
                                   key={f.id}
                                   style={{
@@ -11442,6 +12372,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                 key={r.id}
                                 data-rowkey={`${activeCollection.id}:${r.id}`}
                                 onClick={() => setActiveRowId(r.id)}
+                                onContextMenu={(e) => { e.preventDefault(); setActiveRowId(r.id); setRowCtxMenu({ collectionId: activeCollection.id, rowId: r.id, x: e.clientX, y: e.clientY }); }}
                                 onDragOver={(e) => {
                                   if (!draggingRowId || draggingRowId === r.id) return;
                                   e.preventDefault();
@@ -11563,16 +12494,24 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                   </td>
                                 )}
 
-                                {activeCollection.schema.map((f) => (
+                                {activeCollection.schema.filter((f) => f.id !== "description" || activeCollection.descriptionEnabled !== false).map((f) => (
                                   <td
                                     key={f.id}
                                     style={{
-                                      padding: "6px 10px",
+                                      padding: "3px 10px",
                                       borderBottom: "1px solid var(--border-row)",
-                                      verticalAlign: f.type === "text" ? "top" : "middle",
+                                      verticalAlign: "middle",
                                     }}
                                   >
-                                    {f.id === "id" ? (
+                                    {f.id === "description" ? (
+                                      <div
+                                        onClick={() => openRecordPage(activeCollection.id, r.id)}
+                                        title={t("rec.editAsPage")}
+                                        style={{ fontSize: 13, color: "var(--text-2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: "pointer", opacity: String(r.values["description"] ?? "").trim() ? 0.95 : 0.45 }}
+                                      >
+                                        {String(r.values["description"] ?? "").replace(/\s+/g, " ").trim() || t("rec.editAsPageDots")}
+                                      </div>
+                                    ) : f.id === "id" ? (
                                       (() => {
                                         const cellKey = `${activeCollection.id}:${r.id}:${f.id}`;
                                         const currentValue = String(r.values[f.id] ?? "");
@@ -11907,54 +12846,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                         })()}
                                         ({(r.assets ?? []).length})
                                       </button>
-
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          deleteRow(activeCollection.id, r.id);
-                                        }}
-                                        title="Delete row"
-                                        style={{
-                                          borderRadius: 8,
-                                          border: "1px solid var(--danger-border)",
-                                          background: "var(--danger-bg)",
-                                          color: "var(--text)",
-                                          cursor: "pointer",
-                                          padding: "6px 8px",
-                                          fontSize: 12,
-                                          alignSelf: "stretch",
-                                        }}
-                                      >
-                                        ✕
-                                      </button>
                                     </div>
                                   </td>
-                                ) : (
-                                  <td style={{ padding: "6px 10px", borderBottom: "1px solid var(--border-row)", width: 48 }}>
-                                    <div style={{ display: "flex", gap: 6 }}>
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          deleteRow(activeCollection.id, r.id);
-                                        }}
-                                        title="Delete row"
-                                        style={{
-                                          borderRadius: 8,
-                                          border: "1px solid var(--danger-border)",
-                                          background: "var(--danger-bg)",
-                                          color: "var(--text)",
-                                          cursor: "pointer",
-                                          padding: "6px 8px",
-                                          fontSize: 12,
-                                        }}
-                                      >
-                                        ✕
-                                      </button>
-                                    </div>
-                                  </td>
-                                )}
+                                ) : null}
                               </tr>
                             ))}
                           </tbody>
@@ -11965,6 +12859,14 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 </div>
                 )}
               </Panel>
+            )}
+
+            {/* DUAL TOOL (right side) */}
+            {dualToolActive && dualToolSide === "right" && (
+              <>
+                <PanelResizeHandle className="resize-handle" />
+                {renderDualToolPanel()}
+              </>
             )}
           </PanelGroup>
         </div>
@@ -11996,7 +12898,6 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
           const close = () => setAssetCtxMenu(null);
           const itemStyle: React.CSSProperties = { textAlign: "left", border: "none", background: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "7px 10px", fontSize: 13, borderRadius: 6, whiteSpace: "nowrap" };
           const dangerStyle: React.CSSProperties = { ...itemStyle, color: "var(--danger-text)" };
-          const entityLabelText = String(row.values["id"] || getRowLabel(row) || row.id);
 
           return (
             <div
@@ -12033,23 +12934,82 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 const isProfile = row.profileAssetId === a.id;
                 return (
                   <>
-                    <button type="button" className="ctxItem" style={itemStyle} onClick={async () => { close(); const url = await getSignedAssetUrl(a.path); if (!url) { await appModal.alert("Could not open this asset.", { title: "Open failed" }); return; } window.open(url, "_blank", "noopener,noreferrer"); }}>
-                      Open
+                    <button type="button" className="ctxItem" style={itemStyle} onClick={() => { close(); openAssetPreview(col.id, row.id, a.id); }}>
+                      {t("common.open")}
                     </button>
                     <button type="button" className="ctxItem" style={itemStyle} onClick={() => { close(); renameEntityAsset(col.id, row.id, a.id); }}>
-                      Rename
+                      {t("common.rename")}
                     </button>
                     {isImage && (
                       <button type="button" className="ctxItem" disabled={isProfile} style={{ ...itemStyle, opacity: isProfile ? 0.5 : 1, cursor: isProfile ? "default" : "pointer" }} onClick={() => { close(); setEntityProfileAsset(col.id, row.id, a.id); }}>
-                        {isProfile ? `Current icon for ${entityLabelText} ✓` : `Set as icon for ${entityLabelText}`}
+                        {isProfile ? `${t("asset.currentIcon")} ✓` : t("asset.setAsIcon")}
                       </button>
                     )}
-                    <button type="button" className="ctxItem" style={dangerStyle} onClick={async () => { close(); const ok = await appModal.confirm({ title: "Delete asset?", message: `Delete "${a.name}"?`, confirmText: "Delete", cancelText: "Cancel", danger: true }); if (!ok) return; deleteEntityAsset(col.id, row.id, a.id); }}>
-                      Delete
+                    <button type="button" className="ctxItem" style={dangerStyle} onClick={async () => { close(); const ok = await appModal.confirm({ title: t("asset.deleteQ"), message: t("asset.deleteMsg"), confirmText: t("common.delete"), cancelText: t("common.cancel"), danger: true }); if (!ok) return; deleteEntityAsset(col.id, row.id, a.id); }}>
+                      {t("common.delete")}
                     </button>
                   </>
                 );
               })()}
+            </div>
+          );
+        })()}
+
+        {/* Record row right-click menu */}
+        {rowCtxMenu && project && (() => {
+          const m = rowCtxMenu;
+          const close = () => setRowCtxMenu(null);
+          const itemStyle: React.CSSProperties = { textAlign: "left", border: "none", background: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "7px 10px", fontSize: 13, borderRadius: 6, whiteSpace: "nowrap" };
+          return (
+            <>
+              <div onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} style={{ position: "fixed", inset: 0, zIndex: 290 }} />
+              <div style={{ position: "fixed", top: Math.min(m.y + 4, window.innerHeight - 120), left: Math.max(8, Math.min(m.x, window.innerWidth - 200)), zIndex: 300, minWidth: 180, background: "var(--bg-elevated)", border: "1px solid var(--border-2)", borderRadius: 8, padding: 6, boxShadow: "0 10px 25px var(--overlay-3)", display: "flex", flexDirection: "column", gap: 2 }}>
+                <button type="button" className="ctxItem" style={itemStyle} onClick={() => { close(); openRecordPage(m.collectionId, m.rowId); }}>
+                  {t("rec.editAsPage")}
+                </button>
+                <button type="button" className="ctxItem" style={{ ...itemStyle, color: "var(--danger-text)" }} onClick={() => { close(); deleteRow(m.collectionId, m.rowId); }}>
+                  {t("rec.deleteRow")}
+                </button>
+              </div>
+            </>
+          );
+        })()}
+
+        {/* Asset image preview window */}
+        {assetPreview && project && (() => {
+          const col = project.collections.find((c) => c.id === assetPreview.collectionId);
+          const row = col?.rows.find((r) => r.id === assetPreview.rowId);
+          const a = row?.assets?.find((x) => x.id === assetPreview.assetId);
+          if (!col || !row || !a) return null;
+          const url = assetUrlCache[a.path];
+          const close = () => setAssetPreview(null);
+          return (
+            <div
+              style={{ position: "fixed", inset: 0, backgroundColor: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 320, padding: 24 }}
+              onMouseDown={(e) => { if (e.target === e.currentTarget) close(); }}
+            >
+              <div style={{ width: 520, maxWidth: "100%", maxHeight: "100%", background: "var(--bg-panel)", border: "1px solid var(--border-2)", borderRadius: 12, padding: 12, boxShadow: "0 12px 30px var(--overlay-2)", display: "flex", flexDirection: "column", gap: 10, minHeight: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                    <AssetTypeBadge name={a.name} mime={a.mime} />
+                    <div style={{ fontSize: 13, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.name}</div>
+                  </div>
+                  <button type="button" onClick={close} style={{ borderRadius: 8, border: "1px solid var(--border-3)", background: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "5px 10px", height: 30 }}>{t("common.close")}</button>
+                </div>
+                <div style={{ flex: "1 1 auto", minHeight: 200, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg-deep, var(--bg-surface))", borderRadius: 8, overflow: "hidden" }}>
+                  {url ? (
+                    <img src={url} alt={a.name} onError={() => getSignedAssetUrl(a.path)} style={{ maxWidth: "100%", maxHeight: "60vh", objectFit: "contain", display: "block" }} />
+                  ) : (
+                    <div style={{ fontSize: 12, opacity: 0.6, padding: 24 }}>Loading…</div>
+                  )}
+                </div>
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+                  <button type="button" onClick={() => { close(); openAssetsForEntity(col.id, row.id); }}
+                    style={{ borderRadius: 8, border: "1px solid var(--accent)", background: "var(--accent-bg)", color: "var(--text)", cursor: "pointer", padding: "7px 14px", fontSize: 13 }}>
+                    {t("rec.editAssets")}
+                  </button>
+                </div>
+              </div>
             </div>
           );
         })()}
@@ -12089,7 +13049,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                   return (
                     <>
                       <button type="button" className="ctxItem" style={itemStyle} onClick={() => { close(); m.kind === "doc" ? addDocument(path) : addCollection(path); }}>
-                        {m.kind === "doc" ? "New document here" : "New table here"}
+                        {m.kind === "doc" ? t("side.newDocHere") : t("side.newTableHere")}
                       </button>
                       <button type="button" className="ctxItem" style={itemStyle} onClick={() => { close(); addFolder(m.kind, path); }}>
                         New subfolder
@@ -12147,7 +13107,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             onAddLabelPin={addWorldMapLabelPin}
             onMoveLabelPin={updateWorldMapLabelPinPos}
             onRemoveLabelPin={removeWorldMapLabelPin}
+            onSetDocPinBorder={setWorldMapDocPinBorder}
+            onSetLabelPinBorder={setWorldMapLabelPinBorder}
             onOpenDoc={(id) => { setActiveDocId(id); setWorldMapOpen(false); }}
+            onOpenRecord={(cid, eid) => { openRecordPage(cid, eid); setWorldMapOpen(false); }}
             onSave={() => saveProjectToSupabase()}
             showWikiOption={!isDesktop}
             savedMaps={(archiveActiveWorldMap(project).worldMaps).map((m) => ({ id: m.id, name: m.name, hasImage: !!m.imagePath }))}
@@ -12162,7 +13125,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         )}
 
         {/* TIMELINE overlay (web only; desktop opens the timeline in a window) */}
-        {timelineEnabled && !isDesktop && (
+        {timelineEnabled && !isDesktop && !(dualToolActive && dualTool === "timeline") && (
           <div
             style={{
               position: "fixed",
@@ -12204,6 +13167,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                 onUploadCover={uploadTimelineCover}
                 onRemoveCover={removeTimelineCover}
                 onSelectEntity={openEntityInCollection}
+                style={timelineStyle}
+                onSetStyle={setTimelineStyle}
+                lineDocs={timelineLine.docs}
+                linePins={timelineLine.pins}
+                onAddLineDoc={addTimelineLineDoc}
+                onUpdateLineDoc={updateTimelineLineDoc}
+                onRemoveLineDoc={removeTimelineLineDoc}
+                onAddLinePin={addTimelineLinePin}
+                onUpdateLinePin={updateTimelineLinePin}
+                onRemoveLinePin={removeTimelineLinePin}
+                onSetLineOrder={setTimelineLineOrder}
                 onClose={() => setTimelineVisible(false)}
               />
             </div>

@@ -33,6 +33,12 @@ export interface CollectionRow {
   values: Record<string, string | number>;
   assets?: AssetFile[]; // file attachments
   profileAssetId?: Id;  // one of assets[].id
+
+  // Rich body for the record's Description field (edited "as a page"), mirroring how
+  // documents store richContent + entityLinks. `values.description` is the plain-text
+  // mirror (table preview / export / wiki fallback).
+  descriptionRich?: string;            // Lexical JSON
+  descriptionLinks?: EntityLink[];     // entity-link chips within the description
 }
 
 export interface Collection {
@@ -46,6 +52,7 @@ export interface Collection {
   color: string; // UI + highlight color
   kind: CollectionKind;
   assetsEnabled?: boolean; // default true; when false, hide asset/profile UI for this collection
+  descriptionEnabled?: boolean; // default true; when false, hide the Description column/body
   schema: CollectionField[];
   rows: CollectionRow[];
 }
@@ -144,6 +151,31 @@ export interface TimelineLabel {
   entityId: Id;
 }
 
+// ── Line-style (Gantt) timeline ──────────────────────────────────────────────
+// An alternative timeline layout: a single horizontal line where docs occupy a
+// start..end span and records can be pinned as points or spans. Positions are
+// abstract fractions of the line (0–100), independent of the section-style data.
+export interface TimelineLineDoc {
+  docId: Id;
+  start: number; // 0–100
+  end?: number;  // 0–100 (>= start); when unset the doc is a pin, not a range
+  order?: number; // vertical lane order (sorted ascending); fractional values allowed
+}
+
+export interface TimelineLinePin {
+  id: Id;
+  collectionId: Id;
+  entityId: Id;
+  start: number;  // 0–100
+  end?: number;   // when set, the pin is a range; otherwise a single point
+  order?: number; // vertical lane order (sorted ascending); fractional values allowed
+}
+
+export interface TimelineLine {
+  docs: TimelineLineDoc[];
+  pins: TimelineLinePin[];
+}
+
 export type TimelineCoversMap = Record<number, string>; // beat -> Supabase storage path (bucket "assets")
 
 export interface TimelineCover {
@@ -151,11 +183,15 @@ export interface TimelineCover {
   path: string;     // Supabase storage path (bucket "assets")
 }
 
+// A drawn region (polygonal lasso) attached to a pin. Percentage points of the map.
+export interface MapBorderPoint { x: number; y: number }
+
 export interface WorldMapDocPin {
   id: Id;
   docId: Id;
   x: number; // 0–100, percentage of map image width
   y: number; // 0–100, percentage of map image height
+  border?: MapBorderPoint[]; // optional drawn region linked to this pin
 }
 
 export interface WorldMapLabelPin {
@@ -164,6 +200,7 @@ export interface WorldMapLabelPin {
   entityId: Id;
   x: number;
   y: number;
+  border?: MapBorderPoint[];
 }
 
 // A saved world map = a record + its image + its own pins. The currently-open map's
@@ -210,6 +247,9 @@ export interface ProjectViewSettings {
   // ✅ Custom title per timeline section/beat (beat index -> title)
   timelineSectionTitles?: Record<number, string>;
 
+  // ✅ Timeline layout: classic sections, or a single Gantt-style line. Default "section".
+  timelineStyle?: "section" | "line";
+
   // ✅ Public wiki publishing settings
   wiki?: WikiSettings;
 
@@ -222,6 +262,11 @@ export interface ProjectViewSettings {
   uiShowAssetsTree?: boolean;  // Assets tree in the left sidebar
   uiShowDialogueTree?: boolean; // Datasets tree in the left sidebar
   activeDatasetId?: Id;        // selected dataset for the Dataset view
+
+  // Dual-view tool side (web only): when set, one side of Dual view shows the
+  // Timeline or World Map; the other side acts like focus mode (doc/database/conditions).
+  uiDualTool?: "timeline" | "worldmap" | null;
+  uiDualToolSide?: "left" | "right"; // which side hosts the tool
 
   // ✅ Persist timeline overlay height
   uiTimelineHeight?: number;
@@ -269,6 +314,7 @@ export interface Project {
   view?: ProjectViewSettings;
 
   timelineLabels?: TimelineLabel[];
+  timelineLine?: TimelineLine; // line-style (Gantt) data; independent of section data
   worldMapDocPins?: WorldMapDocPin[];
   worldMapLabelPins?: WorldMapLabelPin[];
   worldMaps?: WorldMapEntry[]; // archive of all saved maps (incl. the active one)

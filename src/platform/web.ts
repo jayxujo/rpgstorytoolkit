@@ -2,8 +2,9 @@ import { supabase } from '../supabaseClient';
 import type { Project } from '../types';
 import type { Platform, PlatformUser, PlatformProfile, LoadedProject } from './types';
 import { createSeedProject, DEFAULT_PROJECT_NAME } from './seedProject';
+import { getExperience } from '../persona';
 
-const blankProject = () => createSeedProject();
+const blankProject = () => createSeedProject(DEFAULT_PROJECT_NAME, getExperience());
 
 export const webPlatform: Platform = {
   async openExternal(url: string): Promise<void> {

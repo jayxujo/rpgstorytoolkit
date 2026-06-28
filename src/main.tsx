@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { AuthGate } from "./AuthGate";
 import { AppModalProvider } from "./AppModal";
+import { LanguageProvider } from "./i18n";
 import { TimelineWindow } from "./TimelineWindow";
 import { isTimelineView } from "./platform/timelineWindow";
 import { WorldMapWindow } from "./WorldMapWindow";
@@ -10,28 +11,14 @@ import "./index.css";
 
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
-if (isTimelineView()) {
-  root.render(
-    <React.StrictMode>
+const view = isTimelineView() ? <TimelineWindow /> : isWorldMapView() ? <WorldMapWindow /> : <AuthGate />;
+
+root.render(
+  <React.StrictMode>
+    <LanguageProvider>
       <AppModalProvider>
-        <TimelineWindow />
+        {view}
       </AppModalProvider>
-    </React.StrictMode>
-  );
-} else if (isWorldMapView()) {
-  root.render(
-    <React.StrictMode>
-      <AppModalProvider>
-        <WorldMapWindow />
-      </AppModalProvider>
-    </React.StrictMode>
-  );
-} else {
-  root.render(
-    <React.StrictMode>
-      <AppModalProvider>
-        <AuthGate />
-      </AppModalProvider>
-    </React.StrictMode>
-  );
-}
+    </LanguageProvider>
+  </React.StrictMode>
+);

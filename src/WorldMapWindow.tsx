@@ -98,9 +98,15 @@ export const WorldMapWindow: React.FC = () => {
         emitWorldMapMutation({ kind: "moveLabelPin", pinId, x, y });
       }}
       onRemoveLabelPin={(pinId) => emitWorldMapMutation({ kind: "removeLabelPin", pinId })}
+      onSetDocPinBorder={(pinId, border) => emitWorldMapMutation({ kind: "setDocPinBorder", pinId, border })}
+      onSetLabelPinBorder={(pinId, border) => emitWorldMapMutation({ kind: "setLabelPinBorder", pinId, border })}
       onOpenDoc={(id) => {
         emitWorldMapMutation({ kind: "openDoc", docId: id });
         // The doc opens in the main window — bring it to the front so "Read more" feels responsive.
+        import("./platform/worldMapWindow").then((m) => m.focusMainWindow());
+      }}
+      onOpenRecord={(collectionId, entityId) => {
+        emitWorldMapMutation({ kind: "openRecord", collectionId, entityId });
         import("./platform/worldMapWindow").then((m) => m.focusMainWindow());
       }}
       onSave={() => emitWorldMapMutation({ kind: "save" })}

@@ -66,6 +66,17 @@ export const TimelineWindow: React.FC = () => {
         onSelectEntity={(collectionId, entityId) =>
           emitTimelineMutation({ kind: "selectEntity", collectionId, entityId })
         }
+        style={state.style ?? "section"}
+        onSetStyle={(s) => emitTimelineMutation({ kind: "setStyle", style: s })}
+        lineDocs={state.lineDocs ?? []}
+        linePins={state.linePins ?? []}
+        onAddLineDoc={(docId, start, order) => emitTimelineMutation({ kind: "addLineDoc", docId, start, order })}
+        onUpdateLineDoc={(docId, start, end) => emitTimelineMutation({ kind: "updateLineDoc", docId, start, end })}
+        onRemoveLineDoc={(docId) => emitTimelineMutation({ kind: "removeLineDoc", docId })}
+        onAddLinePin={(collectionId, entityId, start, order) => emitTimelineMutation({ kind: "addLinePin", collectionId, entityId, start, order })}
+        onUpdateLinePin={(id, start, end) => emitTimelineMutation({ kind: "updateLinePin", id, start, end })}
+        onRemoveLinePin={(id) => emitTimelineMutation({ kind: "removeLinePin", id })}
+        onSetLineOrder={(kind, id, order) => emitTimelineMutation({ kind: "setLineOrder", itemKind: kind, id, order })}
       />
     </div>
   );

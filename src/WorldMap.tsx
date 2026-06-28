@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { Id, Document, Collection, WorldMapDocPin, WorldMapLabelPin, WorldNameCtx } from "./types";
 import { entityLabel } from "./entityLabel";
+import { useLang } from "./i18n";
 
 interface WorldMapProps {
   imageUrl: string | null;
@@ -24,9 +25,13 @@ interface WorldMapProps {
   onAddLabelPin: (collectionId: Id, entityId: Id, x: number, y: number) => void;
   onMoveLabelPin: (pinId: Id, x: number, y: number) => void;
   onRemoveLabelPin: (pinId: Id) => void;
+  onSetDocPinBorder: (pinId: Id, border: { x: number; y: number }[] | null) => void;
+  onSetLabelPinBorder: (pinId: Id, border: { x: number; y: number }[] | null) => void;
   onOpenDoc: (id: Id) => void;
+  onOpenRecord?: (collectionId: Id, entityId: Id) => void;
   onSave: () => void;
   showWikiOption?: boolean; // hide the "Include in wiki" toggle on desktop
+  embedded?: boolean; // when true, fill the parent container instead of a full-screen overlay
 
   // Multi-map management (File menu)
   savedMaps: { id: string; name: string; hasImage: boolean }[];
@@ -62,9 +67,13 @@ const WorldMap: React.FC<WorldMapProps> = ({
   onAddLabelPin,
   onMoveLabelPin,
   onRemoveLabelPin,
+  onSetDocPinBorder,
+  onSetLabelPinBorder,
   onOpenDoc,
+  onOpenRecord,
   onSave,
   showWikiOption = true,
+  embedded = false,
   savedMaps,
   activeMapId,
   onMakeNewMap,
@@ -74,6 +83,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
   onClearLabelPins,
   saveMessage,
 }) => {
+  const { t } = useLang();
   const imgRef = useRef<HTMLImageElement | null>(null);
   const didDrag = useRef(false);
   // Timestamp of the last pin drag end. Used to ignore the click that browsers fire
@@ -100,6 +110,154 @@ const WorldMap: React.FC<WorldMapProps> = ({
 
   const [popupPinId, setPopupPinId] = useState<string | null>(null);
   const [draggingPin, setDraggingPin] = useState<{ id: string; kind: "doc" | "label" } | null>(null);
+
+  // ── Pan / zoom canvas ───────────────────────────────────────────────────────
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [imgNatural, setImgNatural] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  // Map a percentage map-point to a pixel position within the viewport. Pins + borders
+  // render in a non-transformed overlay using this, so they stay crisp at any zoom.
+  const toScreen = (xPct: number, yPct: number) => ({
+    left: pan.x + (xPct / 100) * imgNatural.w * zoom,
+    top: pan.y + (yPct / 100) * imgNatural.h * zoom,
+  });
+  const panningRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const ZOOM_MIN = 0.15;
+  const ZOOM_MAX = 8;
+
+  // Center + fit the map so even a small image fills a good portion of the view
+  // (scales up to a minimum, down to fit a large one), leaving a margin.
+  const fitToView = () => {
+    const vp = viewportRef.current;
+    const img = imgRef.current;
+    if (!vp || !img) return;
+    const vw = vp.clientWidth;
+    const vh = vp.clientHeight;
+    const iw = img.naturalWidth;
+    const ih = img.naturalHeight;
+    if (vw <= 0 || vh <= 0 || iw <= 0 || ih <= 0) return; // not laid out / not loaded yet
+    const pad = 0.92; // leave a small margin
+    // Fit large images down; scale small images up to at least fill ~70% of the view.
+    const fit = Math.min((vw / iw) * pad, (vh / ih) * pad);
+    const minFill = Math.min((vw * 0.7) / iw, (vh * 0.7) / ih);
+    const z = Math.max(Math.min(fit, ZOOM_MAX), Math.min(minFill, ZOOM_MAX), ZOOM_MIN);
+    setZoom(z);
+    setPan({ x: (vw - iw * z) / 2, y: (vh - ih * z) / 2 });
+  };
+
+  const zoomAt = (clientX: number, clientY: number, factor: number) => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const rect = vp.getBoundingClientRect();
+    const mx = clientX - rect.left;
+    const my = clientY - rect.top;
+    setZoom((z) => {
+      const nz = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z * factor));
+      const k = nz / z;
+      setPan((p) => ({ x: mx - (mx - p.x) * k, y: my - (my - p.y) * k }));
+      return nz;
+    });
+  };
+
+  const onCanvasWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+  };
+
+  // Pan when dragging empty map area (not on a pin, not while placing a pin).
+  const startPan = (e: React.MouseEvent) => {
+    if (addMode !== "none" || drawing) return;
+    if (e.button !== 0) return;
+    panningRef.current = { startX: e.clientX, startY: e.clientY, panX: pan.x, panY: pan.y };
+    setIsPanning(true);
+    const onMove = (ev: MouseEvent) => {
+      const s = panningRef.current;
+      if (!s) return;
+      setPan({ x: s.panX + (ev.clientX - s.startX), y: s.panY + (ev.clientY - s.startY) });
+    };
+    const onUp = () => {
+      panningRef.current = null;
+      setIsPanning(false);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  // ── Pin region drawing (polygonal lasso) ────────────────────────────────────
+  const [pinCtxMenu, setPinCtxMenu] = useState<{ kind: "doc" | "label"; pinId: string; x: number; y: number } | null>(null);
+  const [drawing, setDrawing] = useState<{ kind: "doc" | "label"; pinId: string } | null>(null);
+  const [drawPoints, setDrawPoints] = useState<{ x: number; y: number }[]>([]);
+  const [cursorPt, setCursorPt] = useState<{ x: number; y: number } | null>(null);
+  const [highlightPinId, setHighlightPinId] = useState<string | null>(null);
+
+  const pctFromEvent = (clientX: number, clientY: number): { x: number; y: number } | null => {
+    const img = imgRef.current;
+    if (!img) return null;
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: Math.max(0, Math.min(100, ((clientX - rect.left) / rect.width) * 100)),
+      y: Math.max(0, Math.min(100, ((clientY - rect.top) / rect.height) * 100)),
+    };
+  };
+
+  const pinColor = (kind: "doc" | "label", pin: WorldMapDocPin | WorldMapLabelPin): string => {
+    if (kind === "label") {
+      const lp = pin as WorldMapLabelPin;
+      return collections.find((c) => c.id === lp.collectionId)?.color ?? "#9aa0a6";
+    }
+    return "#9aa0a6"; // doc pins → neutral grey
+  };
+
+  const startDrawBorder = (kind: "doc" | "label", pinId: string) => {
+    setPinCtxMenu(null);
+    setAddMode("none");
+    setPopupPinId(null);
+    setDrawPoints([]);
+    setCursorPt(null);
+    setDrawing({ kind, pinId });
+  };
+
+  const completeBorder = () => {
+    if (!drawing) return;
+    const pts = drawPoints;
+    if (pts.length >= 3) {
+      if (drawing.kind === "doc") onSetDocPinBorder(drawing.pinId as Id, pts);
+      else onSetLabelPinBorder(drawing.pinId as Id, pts);
+      onSave();
+    }
+    setDrawing(null);
+    setDrawPoints([]);
+    setCursorPt(null);
+  };
+
+  const cancelDrawing = () => {
+    setDrawing(null);
+    setDrawPoints([]);
+    setCursorPt(null);
+  };
+
+  const deleteBorder = (kind: "doc" | "label", pinId: string) => {
+    if (kind === "doc") onSetDocPinBorder(pinId as Id, null);
+    else onSetLabelPinBorder(pinId as Id, null);
+    onSave();
+  };
+
+  // Esc cancels an in-progress drawing; Enter completes it.
+  useEffect(() => {
+    if (!drawing) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); cancelDrawing(); }
+      else if (e.key === "Enter") { e.preventDefault(); completeBorder(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawing, drawPoints]);
 
   const [uploading, setUploading] = useState(false);
   const [showAssetPicker, setShowAssetPicker] = useState(false);
@@ -135,6 +293,15 @@ const WorldMap: React.FC<WorldMapProps> = ({
     setShowAssetPicker(true);
   };
 
+  // Fit the map when its image changes (covers cached images where onLoad is immediate
+  // and the case where the viewport lays out after the image is ready).
+  useEffect(() => {
+    if (!imageUrl) return;
+    const id = requestAnimationFrame(() => fitToView());
+    return () => cancelAnimationFrame(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageUrl]);
+
   // Two-step setup wizard: 1 = create/select the world record, 2 = set its map image.
   const [setupStep, setSetupStep] = useState<1 | 2>(1);
   useEffect(() => {
@@ -151,6 +318,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
     pinId: string,
     kind: "doc" | "label"
   ) => {
+    if (drawing) return; // don't move pins while drawing a border
     e.preventDefault();
     e.stopPropagation();
     didDrag.current = false;
@@ -197,7 +365,70 @@ const WorldMap: React.FC<WorldMapProps> = ({
     window.addEventListener("mouseup", onUp);
   };
 
+  // Drag an existing border: "move" shifts the whole shape; "vertex" reshapes one point.
+  const startBorderDrag = (
+    e: React.MouseEvent,
+    kind: "doc" | "label",
+    pinId: string,
+    mode: "move" | "vertex",
+    vertexIndex?: number
+  ) => {
+    if (drawing || addMode !== "none") return;
+    if ((e as React.MouseEvent).button === 2) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const pin = (kind === "doc" ? docPins : labelPins).find((p) => p.id === pinId) as
+      | WorldMapDocPin
+      | WorldMapLabelPin
+      | undefined;
+    if (!pin?.border || pin.border.length < 3) return;
+    const startBorder = pin.border.map((p) => ({ ...p }));
+    const img = imgRef.current;
+    if (!img) return;
+    const rect = img.getBoundingClientRect();
+    const clamp = (n: number) => Math.max(0, Math.min(100, n));
+    const at = (cx: number, cy: number) => ({
+      x: ((cx - rect.left) / rect.width) * 100,
+      y: ((cy - rect.top) / rect.height) * 100,
+    });
+    const start = at(e.clientX, e.clientY);
+    setHighlightPinId(pinId);
+    const setBorder = kind === "doc" ? onSetDocPinBorder : onSetLabelPinBorder;
+    let moved = false;
+
+    const onMove = (ev: MouseEvent) => {
+      const cur = at(ev.clientX, ev.clientY);
+      const dx = cur.x - start.x;
+      const dy = cur.y - start.y;
+      moved = true;
+      const next =
+        mode === "move"
+          ? startBorder.map((p) => ({ x: clamp(p.x + dx), y: clamp(p.y + dy) }))
+          : startBorder.map((p, i) => (i === vertexIndex ? { x: clamp(p.x + dx), y: clamp(p.y + dy) } : p));
+      setBorder(pinId as Id, next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (moved) { onSave(); dragEndedAt.current = Date.now(); }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    // Drawing a border: each click adds a vertex; clicking near the first point
+    // (a "full circle") closes the shape.
+    if (drawing) {
+      const pt = pctFromEvent(e.clientX, e.clientY);
+      if (!pt) return;
+      if (drawPoints.length >= 3) {
+        const first = drawPoints[0];
+        if (Math.hypot(pt.x - first.x, pt.y - first.y) < 3) { completeBorder(); return; }
+      }
+      setDrawPoints((p) => [...p, pt]);
+      return;
+    }
     if (addMode === "none") return;
     // Never place while a pin drag is in progress or just finished.
     if (draggingPin) return;
@@ -238,9 +469,9 @@ const WorldMap: React.FC<WorldMapProps> = ({
   };
 
   const overlayStyle: React.CSSProperties = {
-    position: "fixed",
+    position: embedded ? "absolute" : "fixed",
     inset: 0,
-    zIndex: 85,
+    zIndex: embedded ? 1 : 85,
     background: "var(--bg)",
     display: "flex",
     flexDirection: "column",
@@ -325,7 +556,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
     const recAssets = recordImageAssets(worldNameCollectionId, worldNameEntityId);
     return (
       <div style={{ position: "relative" }}>
-        <button type="button" style={fileMenuOpen ? btnActive : btnBase} onClick={() => setFileMenuOpen((o) => !o)}>File ▾</button>
+        <button type="button" style={fileMenuOpen ? btnActive : btnBase} onClick={() => setFileMenuOpen((o) => !o)}>{t("menu.file")} ▾</button>
         {fileMenuOpen && (
           <>
             <div onClick={closeMenu} style={{ position: "fixed", inset: 0, zIndex: 110 }} />
@@ -355,7 +586,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                     onMouseEnter={() => { setLoadOpen(false); setReplaceOpen(false); }}
                     onClick={() => { closeMenu(); onSave(); }}
                   >
-                    <span>Save now</span>
+                    <span>{t("file.saveNow")}</span>
                   </button>
                   <div style={menuDivider} />
                   <button
@@ -367,11 +598,11 @@ const WorldMap: React.FC<WorldMapProps> = ({
                       askConfirm(
                         "This map is saved — you can reopen it any time from File ▸ Load map. Start a new map?",
                         () => onMakeNewMap(),
-                        { confirmLabel: "New map" }
+                        { confirmLabel: t("wmap.makeNewMap") }
                       );
                     }}
                   >
-                    <span>Make new map</span>
+                    <span>{t("wmap.makeNewMap")}</span>
                   </button>
                 </>
               )}
@@ -384,13 +615,13 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   onMouseEnter={() => { setLoadOpen(loadable.length > 0); setReplaceOpen(false); }}
                   onClick={() => loadable.length > 0 && setLoadOpen((o) => !o)}
                 >
-                  <span style={{ opacity: loadable.length > 0 ? 1 : 0.5 }}>Load map</span>
+                  <span style={{ opacity: loadable.length > 0 ? 1 : 0.5 }}>{t("wmap.loadMap")}</span>
                   <span style={{ opacity: 0.9 }}>▸</span>
                 </button>
                 {loadOpen && (
                   <div style={flyoutPanel} onMouseEnter={() => setLoadOpen(true)}>
                     {loadable.length === 0 ? (
-                      <div style={{ ...fileItem, border: "none", cursor: "default", opacity: 0.5 }}>No saved maps</div>
+                      <div style={{ ...fileItem, border: "none", cursor: "default", opacity: 0.5 }}>{t("wmap.noSavedMaps")}</div>
                     ) : (
                       loadable.map((m) => (
                         <button
@@ -422,13 +653,13 @@ const WorldMap: React.FC<WorldMapProps> = ({
                       onMouseEnter={() => { setReplaceOpen(true); setLoadOpen(false); }}
                       onClick={() => setReplaceOpen((o) => !o)}
                     >
-                      <span>{uploading ? "Uploading…" : "Replace image"}</span>
+                      <span>{uploading ? t("common.uploading") : t("wmap.replaceImage")}</span>
                       <span style={{ opacity: 0.9 }}>▸</span>
                     </button>
                     {replaceOpen && (
                       <div style={flyoutPanel} onMouseEnter={() => setReplaceOpen(true)}>
                         <label style={{ ...fileItem, cursor: uploading ? "default" : "pointer" }}>
-                          <span>Upload new image</span>
+                          <span>{t("wmap.uploadNewImage")}</span>
                           <input
                             type="file"
                             accept="image/*"
@@ -453,7 +684,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                             style={fileItem}
                             onClick={() => { closeMenu(); openAssetPicker(recAssets); }}
                           >
-                            <span>Choose from assets</span>
+                            <span>{t("wmap.chooseFromAssets")}</span>
                           </button>
                         )}
                       </div>
@@ -471,7 +702,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                       askConfirm("Clear all document pins from this map?", () => onClearDocPins(), { confirmLabel: "Clear", danger: true });
                     }}
                   >
-                    <span>Clear all doc pins</span>
+                    <span>{t("wmap.clearDocPins")}</span>
                   </button>
                   <button
                     type="button"
@@ -482,7 +713,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                       askConfirm("Clear all record pins from this map?", () => onClearLabelPins(), { confirmLabel: "Clear", danger: true });
                     }}
                   >
-                    <span>Clear all record pins</span>
+                    <span>{t("wmap.clearRecordPins")}</span>
                   </button>
                 </>
               )}
@@ -502,7 +733,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
         <button
           type="button"
           style={{ ...(loadOpen ? btnActive : btnBase), opacity: empty ? 0.5 : 1, cursor: empty ? "default" : "pointer" }}
-          title={empty ? "No maps found" : "Load a saved map"}
+          title={empty ? t("wmap.noSavedMaps") : t("wmap.loadMap")}
           onClick={() => !empty && setLoadOpen((o) => !o)}
         >
           Load map ▾
@@ -560,7 +791,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
       >
         <div style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.5, marginBottom: 16 }}>{confirmDialog.message}</div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <button type="button" style={btnBase} onClick={() => setConfirmDialog(null)}>Cancel</button>
+          <button type="button" style={btnBase} onClick={() => setConfirmDialog(null)}>{t("common.cancel")}</button>
           <button
             type="button"
             style={confirmDialog.danger
@@ -605,8 +836,8 @@ const WorldMap: React.FC<WorldMapProps> = ({
         }}
       >
         <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-2)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ fontWeight: 800, fontSize: 14, color: "var(--text)" }}>Choose an image asset</div>
-          <button type="button" onClick={() => setShowAssetPicker(false)} style={btnBase}>Close</button>
+          <div style={{ fontWeight: 800, fontSize: 14, color: "var(--text)" }}>{t("wmap.chooseImageAsset")}</div>
+          <button type="button" onClick={() => setShowAssetPicker(false)} style={btnBase}>{t("common.close")}</button>
         </div>
         <div style={{ overflow: "auto", padding: 8 }}>
           {pickerAssets.length === 0 ? (
@@ -689,7 +920,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
             setUploading(false);
           }}
         />
-        {uploading ? "Uploading…" : "Click to upload an image"}
+        {uploading ? t("common.uploading") : t("wmap.clickToUpload")}
       </label>
     );
 
@@ -697,11 +928,11 @@ const WorldMap: React.FC<WorldMapProps> = ({
       <div style={overlayStyle}>
         {confirmModal}
         <div style={toolbarStyle}>
-          <span style={{ fontWeight: 700, fontSize: 13, color: "var(--text)" }}>World Map</span>
+          <span style={{ fontWeight: 700, fontSize: 13, color: "var(--text)" }}>{t("term.worldMap")}</span>
           <span style={{ fontSize: 11, opacity: 0.6 }}>Step {setupStep} of 2</span>
           <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
             {renderLoadMapButton()}
-            <button type="button" onClick={onClose} style={btnBase}>Close</button>
+            <button type="button" onClick={onClose} style={btnBase}>{t("common.close")}</button>
           </div>
         </div>
 
@@ -721,7 +952,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
           >
             {setupStep === 1 ? (
               <>
-                <div style={{ fontWeight: 800, fontSize: 16, color: "var(--text)" }}>Create your world</div>
+                <div style={{ fontWeight: 800, fontSize: 16, color: "var(--text)" }}>{t("wmap.createWorld")}</div>
 
                 <div style={{ display: "flex", gap: 8 }}>
                   <button type="button" onClick={() => setNameSourceMode("text")} style={nameSourceMode === "text" ? btnActive : btnBase}>
@@ -734,11 +965,11 @@ const WorldMap: React.FC<WorldMapProps> = ({
 
                 {nameSourceMode === "text" ? (
                   <div>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)", marginBottom: 6 }}>World name</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)", marginBottom: 6 }}>{t("wmap.worldName")}</div>
                     <input
                       autoFocus
                       style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
-                      placeholder="e.g. Azeroth, Middle-earth…"
+                      placeholder={t("wmap.worldNamePh")}
                       value={nameDraft}
                       onChange={(e) => setNameDraft(e.target.value)}
                       onKeyDown={(e) => { if (e.key === "Enter" && step1Valid) setSetupStep(2); }}
@@ -749,7 +980,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   </div>
                 ) : (
                   <div>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)", marginBottom: 6 }}>Pick a record</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)", marginBottom: 6 }}>{t("wmap.pickRecord")}</div>
                     <div style={{ display: "flex", gap: 8 }}>
                       <select
                         className="themed-select"
@@ -757,7 +988,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                         value={nameCollectionId}
                         onChange={(e) => { setNameCollectionId(e.target.value); setNameEntityId(""); }}
                       >
-                        <option value="">Table…</option>
+                        <option value="">{t("cond.phTable")}</option>
                         {collections.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}
                       </select>
                       <select
@@ -767,7 +998,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                         onChange={(e) => setNameEntityId(e.target.value)}
                         disabled={!nameCollectionId}
                       >
-                        <option value="">Record…</option>
+                        <option value="">{t("cond.phRecord")}</option>
                         {(collections.find((c) => c.id === nameCollectionId)?.rows ?? []).map((r) => (
                           <option key={r.id} value={r.id}>{entityLabel(r)}</option>
                         ))}
@@ -799,7 +1030,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
               </>
             ) : (
               <>
-                <div style={{ fontWeight: 800, fontSize: 16, color: "var(--text)" }}>Set the map image</div>
+                <div style={{ fontWeight: 800, fontSize: 16, color: "var(--text)" }}>{t("wmap.setMapImage")}</div>
                 <div style={{ fontSize: 12, opacity: 0.75, marginTop: -8 }}>
                   for <b>{worldLabel}</b>
                 </div>
@@ -844,10 +1075,10 @@ const WorldMap: React.FC<WorldMapProps> = ({
                 )}
 
                 {uploadDropzone}
-                <div style={{ fontSize: 11, opacity: 0.6, marginTop: -8 }}>PNG, JPG, or any image format.</div>
+                <div style={{ fontSize: 11, opacity: 0.6, marginTop: -8 }}>{t("wmap.imageFormats")}</div>
 
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <button type="button" onClick={() => setSetupStep(1)} style={btnBase}>Back</button>
+                  <button type="button" onClick={() => setSetupStep(1)} style={btnBase}>{t("common.back")}</button>
                 </div>
               </>
             )}
@@ -866,6 +1097,10 @@ const WorldMap: React.FC<WorldMapProps> = ({
 
   const popupPin = docPins.find((p) => p.id === popupPinId);
   const popupDoc = popupPin ? documents.find((d) => d.id === popupPin.docId) : null;
+  // Record (label) pin popup: same "read more" card, showing the record's description.
+  const popupLabelPin = labelPins.find((p) => p.id === popupPinId);
+  const popupLabelCol = popupLabelPin ? collections.find((c) => c.id === popupLabelPin.collectionId) : null;
+  const popupLabelRow = popupLabelCol?.rows.find((r) => r.id === popupLabelPin?.entityId) ?? null;
 
   return (
     <div style={overlayStyle}>
@@ -889,7 +1124,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
             }}
             style={addMode === "addDoc" ? btnActive : btnBase}
           >
-            Add document pin
+            {t("wmap.addDocPin")}
           </button>
           {addMode === "addDoc" && (
             <select
@@ -898,7 +1133,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
               value={pendingDocId}
               onChange={(e) => setPendingDocId(e.target.value)}
             >
-              <option value="">Select document…</option>
+              <option value="">{t("wmap.selectDocument")}</option>
               {documents.map((d) => (
                 <option key={d.id} value={d.id}>{d.title || d.id}</option>
               ))}
@@ -906,7 +1141,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
           )}
           {addMode === "addDoc" && pendingDocId && (
             <span style={{ fontSize: 11, color: "var(--accent-text)", opacity: 0.8 }}>
-              Click on the map to place
+              {t("wmap.clickToPlace")}
             </span>
           )}
         </div>
@@ -922,7 +1157,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
             }}
             style={addMode === "addLabel" ? btnActive : btnBase}
           >
-            Add record pin
+            {t("wmap.addRecordPin")}
           </button>
           {addMode === "addLabel" && (
             <>
@@ -932,7 +1167,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                 value={pendingLabelCollectionId}
                 onChange={(e) => { setPendingLabelCollectionId(e.target.value); setPendingLabelEntityId(""); }}
               >
-                <option value="">Table…</option>
+                <option value="">{t("cond.phTable")}</option>
                 {collections.map((c) => (
                   <option key={c.id} value={c.id}>{c.name}</option>
                 ))}
@@ -944,7 +1179,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   value={pendingLabelEntityId}
                   onChange={(e) => setPendingLabelEntityId(e.target.value)}
                 >
-                  <option value="">Record…</option>
+                  <option value="">{t("cond.phRecord")}</option>
                   {(collections.find((c) => c.id === pendingLabelCollectionId)?.rows ?? []).map((r) => (
                     <option key={r.id} value={r.id}>
                       {entityLabel(r)}
@@ -954,7 +1189,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
               )}
               {pendingLabelCollectionId && pendingLabelEntityId && (
                 <span style={{ fontSize: 11, color: "var(--accent-text)", opacity: 0.8 }}>
-                  Click on the map to place
+                  {t("wmap.clickToPlace")}
                 </span>
               )}
             </>
@@ -990,7 +1225,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
             }}
             onMouseEnter={(e) => (e.currentTarget.style.border = "1px solid var(--border-3)")}
             onMouseLeave={(e) => (e.currentTarget.style.border = "1px solid transparent")}
-            title="Edit world name"
+            title={t("wmap.editWorldName")}
           >
             {worldName || entityDisplayName || "Unnamed World"}
             <span style={{ opacity: 0.5, fontSize: 12 }}>✎</span>
@@ -1017,7 +1252,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   gap: 8,
                 }}
               >
-                <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)" }}>World name</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)" }}>{t("wmap.worldName")}</div>
 
                 <div style={{ display: "flex", gap: 6 }}>
                   <button type="button" onClick={() => setNameSourceMode("text")} style={{ ...(nameSourceMode === "text" ? btnActive : btnBase), flex: 1 }}>
@@ -1032,7 +1267,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   <input
                     autoFocus
                     style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
-                    placeholder="World name…"
+                    placeholder={t("wmap.worldNameInputPh")}
                     value={nameDraft}
                     onChange={(e) => setNameDraft(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") commitName(); if (e.key === "Escape") setEditingName(false); }}
@@ -1045,7 +1280,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                       value={nameCollectionId}
                       onChange={(e) => { setNameCollectionId(e.target.value); setNameEntityId(""); }}
                     >
-                      <option value="">Table…</option>
+                      <option value="">{t("cond.phTable")}</option>
                       {collections.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                     </select>
                     <select
@@ -1055,7 +1290,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                       onChange={(e) => setNameEntityId(e.target.value)}
                       disabled={!nameCollectionId}
                     >
-                      <option value="">Record…</option>
+                      <option value="">{t("cond.phRecord")}</option>
                       {(collections.find((c) => c.id === nameCollectionId)?.rows ?? []).map((r) => (
                         <option key={r.id} value={r.id}>{entityLabel(r)}</option>
                       ))}
@@ -1064,8 +1299,8 @@ const WorldMap: React.FC<WorldMapProps> = ({
                 )}
 
                 <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", marginTop: 2 }}>
-                  <button type="button" onClick={() => setEditingName(false)} style={btnBase}>Cancel</button>
-                  <button type="button" onClick={commitName} style={btnActive}>Save</button>
+                  <button type="button" onClick={() => setEditingName(false)} style={btnBase}>{t("common.cancel")}</button>
+                  <button type="button" onClick={commitName} style={btnActive}>{t("common.save")}</button>
                 </div>
               </div>
             </>
@@ -1085,21 +1320,47 @@ const WorldMap: React.FC<WorldMapProps> = ({
                 checked={worldMapIncludeInWiki}
                 onChange={(e) => { onSetIncludeInWiki(e.target.checked); onSave(); }}
               />
-              Include in wiki
+              {t("wmap.includeInWiki")}
             </label>
           </>
         )}
 
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
-          <button type="button" onClick={onClose} style={btnBase}>Close</button>
+          <button type="button" onClick={onClose} style={btnBase}>{t("common.close")}</button>
         </div>
       </div>
 
-      {/* Map canvas */}
+      {/* Map canvas (pan + zoom) */}
       <div
-        style={{ flex: 1, overflow: "auto", position: "relative" }}
+        ref={viewportRef}
+        style={{
+          flex: 1,
+          overflow: "hidden",
+          position: "relative",
+          cursor: (addMode !== "none" || drawing) ? "crosshair" : isPanning ? "grabbing" : "grab",
+          touchAction: "none",
+          // FigJam-style dot grid that pans + scales with the canvas, for orientation.
+          backgroundColor: "var(--bg)",
+          backgroundImage: "radial-gradient(circle, var(--canvas-dot, rgba(255,255,255,0.08)) 1px, transparent 1.5px)",
+          backgroundSize: `${Math.min(60, Math.max(16, 22 * zoom))}px ${Math.min(60, Math.max(16, 22 * zoom))}px`,
+          backgroundPosition: `${pan.x}px ${pan.y}px`,
+        }}
         onClick={() => { setPopupPinId(null); }}
+        onMouseDown={startPan}
+        onMouseMove={(e) => { if (drawing) { const p = pctFromEvent(e.clientX, e.clientY); if (p) setCursorPt(p); } }}
+        onWheel={onCanvasWheel}
       >
+        {/* Zoom controls */}
+        {!imageBroken && (
+          <div style={{ position: "absolute", right: 14, bottom: 14, zIndex: 60, display: "flex", flexDirection: "column", gap: 6 }} onMouseDown={(e) => e.stopPropagation()}>
+            <button type="button" title={t("wmap.zoomIn")} onClick={() => { const vp = viewportRef.current; if (vp) zoomAt(vp.getBoundingClientRect().left + vp.clientWidth / 2, vp.getBoundingClientRect().top + vp.clientHeight / 2, 1.25); }}
+              style={{ width: 34, height: 34, borderRadius: 8, border: "1px solid var(--border-2)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 18, lineHeight: 1 }}>+</button>
+            <button type="button" title={t("wmap.zoomOut")} onClick={() => { const vp = viewportRef.current; if (vp) zoomAt(vp.getBoundingClientRect().left + vp.clientWidth / 2, vp.getBoundingClientRect().top + vp.clientHeight / 2, 1 / 1.25); }}
+              style={{ width: 34, height: 34, borderRadius: 8, border: "1px solid var(--border-2)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 18, lineHeight: 1 }}>−</button>
+            <button type="button" title={t("wmap.fitToView")} onClick={fitToView}
+              style={{ width: 34, height: 34, borderRadius: 8, border: "1px solid var(--border-2)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 13, lineHeight: 1 }}>⤢</button>
+          </div>
+        )}
         {imageBroken && (
           <div
             onClick={(e) => e.stopPropagation()}
@@ -1128,11 +1389,10 @@ const WorldMap: React.FC<WorldMapProps> = ({
               }}
             >
               <div style={{ fontWeight: 800, fontSize: 16, color: "var(--text)" }}>
-                Map image missing
+                {t("wmap.imageMissing")}
               </div>
               <div style={{ fontSize: 13, opacity: 0.8, color: "var(--text-dim)", lineHeight: 1.5 }}>
-                This map's image couldn't be loaded. It may have been deleted from the record's
-                assets. Choose a new image to restore the map.
+                {t("wmap.imageMissingDesc")}
               </div>
               <label
                 style={{
@@ -1159,7 +1419,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                     setUploading(false);
                   }}
                 />
-                {uploading ? "Uploading…" : "Upload new image"}
+                {uploading ? t("common.uploading") : t("wmap.uploadNewImage")}
               </label>
               {(() => {
                 const assets = recordImageAssets(worldNameCollectionId, worldNameEntityId);
@@ -1170,7 +1430,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                     style={btnBase}
                     onClick={() => openAssetPicker(assets)}
                   >
-                    Choose from this record's images
+                    {t("wmap.chooseFromRecord")}
                   </button>
                 );
               })()}
@@ -1181,21 +1441,91 @@ const WorldMap: React.FC<WorldMapProps> = ({
             relative to this element, and those percentages are calculated from the
             image's bounding rect. If this div is larger than the image the two
             coordinate systems diverge and pins land in the wrong place. */}
-        <div style={{ position: "relative", display: "inline-block" }}>
+        <div style={{ position: "absolute", left: 0, top: 0, display: "inline-block", transformOrigin: "0 0", transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
           <img
             ref={imgRef}
             src={imageUrl}
-            alt="World map"
+            alt={t("term.worldMap")}
             draggable={false}
             onError={() => setImageBroken(true)}
+            onLoad={(e) => { setImageBroken(false); const im = e.currentTarget; setImgNatural({ w: im.naturalWidth, h: im.naturalHeight }); fitToView(); }}
             onClick={handleImageClick}
+            onDoubleClick={(e) => { if (drawing) { e.preventDefault(); completeBorder(); } }}
             style={{
               display: "block",
-              maxWidth: "100%",
               userSelect: "none",
-              cursor: addMode !== "none" ? "crosshair" : "default",
+              cursor: (addMode !== "none" || drawing) ? "crosshair" : "default",
             }}
           />
+        </div>
+
+        {/* Pins + borders overlay — NOT transformed, positioned in screen pixels via
+            toScreen() so they stay crisp at any zoom and dots render as true circles. */}
+        <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+          {/* Region borders + in-progress lasso */}
+          <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", overflow: "visible" }}>
+            {[
+              ...docPins.map((p) => ({ kind: "doc" as const, pin: p as WorldMapDocPin | WorldMapLabelPin })),
+              ...labelPins.map((p) => ({ kind: "label" as const, pin: p as WorldMapDocPin | WorldMapLabelPin })),
+            ].map(({ kind, pin }) => {
+              if (!pin.border || pin.border.length < 3) return null;
+              const c = pinColor(kind, pin);
+              const active = highlightPinId === pin.id;
+              const pts = pin.border.map((p) => { const s = toScreen(p.x, p.y); return `${s.left},${s.top}`; }).join(" ");
+              return (
+                <g key={`brd-${pin.id}`}>
+                  <polygon
+                    points={pts}
+                    fill={c}
+                    fillOpacity={active ? 0.5 : 0.28}
+                    stroke={c}
+                    strokeOpacity={active ? 1 : 0.95}
+                    strokeWidth={active ? 4 : 3}
+                    strokeLinejoin="round"
+                    style={{ pointerEvents: (drawing || addMode !== "none") ? "none" : "auto", cursor: "move", transition: "fill-opacity 120ms" }}
+                    onMouseDown={(e) => startBorderDrag(e, kind, pin.id, "move")}
+                    onMouseEnter={() => setHighlightPinId(pin.id)}
+                    onMouseLeave={() => setHighlightPinId((cur) => (cur === pin.id ? null : cur))}
+                    onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setPinCtxMenu({ kind, pinId: pin.id, x: e.clientX, y: e.clientY }); }}
+                  />
+                  {pin.border.map((p, i) => {
+                    const s = toScreen(p.x, p.y);
+                    const interactive = !drawing && addMode === "none";
+                    return (
+                      <circle
+                        key={i}
+                        cx={s.left}
+                        cy={s.top}
+                        r={active ? 5 : 4}
+                        fill="#fff"
+                        stroke={c}
+                        strokeWidth={2}
+                        style={{ pointerEvents: interactive ? "auto" : "none", cursor: "grab" }}
+                        onMouseDown={(e) => startBorderDrag(e, kind, pin.id, "vertex", i)}
+                        onMouseEnter={() => setHighlightPinId(pin.id)}
+                        onMouseLeave={() => setHighlightPinId((cur) => (cur === pin.id ? null : cur))}
+                        onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setPinCtxMenu({ kind, pinId: pin.id, x: e.clientX, y: e.clientY }); }}
+                      />
+                    );
+                  })}
+                </g>
+              );
+            })}
+
+            {/* In-progress drawing: dashed rubber-band + a circle dot at each clicked point */}
+            {drawing && drawPoints.length > 0 && (
+              <>
+                <polyline
+                  points={[...drawPoints, ...(cursorPt ? [cursorPt] : [])].map((p) => { const s = toScreen(p.x, p.y); return `${s.left},${s.top}`; }).join(" ")}
+                  fill="none"
+                  stroke="var(--accent, #4f8cff)"
+                  strokeWidth={2}
+                  strokeDasharray="6 4"
+                />
+                {drawPoints.map((p, i) => { const s = toScreen(p.x, p.y); return <circle key={i} cx={s.left} cy={s.top} r={4.5} fill="#fff" stroke="var(--accent, #4f8cff)" strokeWidth={2} />; })}
+              </>
+            )}
+          </svg>
 
           {/* Doc pins */}
           {docPins.map((pin) => {
@@ -1205,17 +1535,24 @@ const WorldMap: React.FC<WorldMapProps> = ({
                 key={pin.id}
                 style={{
                   position: "absolute",
-                  left: `${pin.x}%`,
-                  top: `${pin.y}%`,
+                  left: `${toScreen(pin.x, pin.y).left}px`,
+                  top: `${toScreen(pin.x, pin.y).top}px`,
                   transform: "translate(-50%, -100%)",
+                  transformOrigin: "center bottom",
                   cursor: draggingPin?.id === pin.id ? "grabbing" : "grab",
                   zIndex: popupPinId === pin.id ? 20 : 10,
                   userSelect: "none",
+                  WebkitUserSelect: "none",
+                  pointerEvents: drawing ? "none" : "auto",
                 }}
-                onMouseDown={(e) => startDragPin(e, pin.id, "doc")}
+                onMouseDown={(e) => { if (e.button === 2) { e.preventDefault(); return; } startDragPin(e, pin.id, "doc"); }}
+                onMouseEnter={() => pin.border && setHighlightPinId(pin.id)}
+                onMouseLeave={() => setHighlightPinId((cur) => (cur === pin.id ? null : cur))}
+                onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setPinCtxMenu({ kind: "doc", pinId: pin.id, x: e.clientX, y: e.clientY }); }}
                 onClick={(e) => {
                   e.stopPropagation();
                   if (Date.now() - dragEndedAt.current < 250) return;
+                  if (pin.border) setHighlightPinId(pin.id);
                   setPopupPinId(pin.id === popupPinId ? null : pin.id);
                 }}
                 title={doc?.title ?? pin.docId}
@@ -1228,7 +1565,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                     transform: "rotate(-45deg)",
                     background: "var(--accent)",
                     border: "2px solid white",
-                    boxShadow: "0 2px 8px rgba(0,0,0,0.5)",
+                    boxShadow: highlightPinId === pin.id ? `0 0 0 2px ${pinColor("doc", pin)}, 0 0 10px 2px ${pinColor("doc", pin)}` : "0 2px 8px rgba(0,0,0,0.5)",
                   }}
                 />
                 {doc && (
@@ -1244,7 +1581,8 @@ const WorldMap: React.FC<WorldMapProps> = ({
                       padding: "2px 6px",
                       fontSize: 10,
                       whiteSpace: "nowrap",
-                      pointerEvents: "none",
+                      pointerEvents: "auto",
+                      cursor: "inherit",
                       color: "var(--text)",
                     }}
                   >
@@ -1265,12 +1603,14 @@ const WorldMap: React.FC<WorldMapProps> = ({
                 key={pin.id}
                 style={{
                   position: "absolute",
-                  left: `${pin.x}%`,
-                  top: `${pin.y}%`,
+                  left: `${toScreen(pin.x, pin.y).left}px`,
+                  top: `${toScreen(pin.x, pin.y).top}px`,
                   transform: "translate(-50%, -50%)",
                   cursor: draggingPin?.id === pin.id ? "grabbing" : "grab",
                   zIndex: 10,
                   userSelect: "none",
+                  WebkitUserSelect: "none",
+                  pointerEvents: drawing ? "none" : "auto",
                   display: "flex",
                   alignItems: "center",
                   gap: 4,
@@ -1281,11 +1621,19 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   fontSize: 11,
                   fontWeight: 700,
                   color: col?.color ?? "var(--text)",
-                  boxShadow: "0 2px 6px rgba(0,0,0,0.4)",
+                  boxShadow: highlightPinId === pin.id ? `0 0 0 2px ${col?.color ?? "var(--accent)"}, 0 0 10px 1px ${col?.color ?? "var(--accent)"}` : "0 2px 6px rgba(0,0,0,0.4)",
                   backdropFilter: "blur(4px)",
                 }}
-                onMouseDown={(e) => startDragPin(e, pin.id, "label")}
-                onClick={(e) => e.stopPropagation()}
+                onMouseDown={(e) => { if (e.button === 2) { e.preventDefault(); return; } startDragPin(e, pin.id, "label"); }}
+                onMouseEnter={() => pin.border && setHighlightPinId(pin.id)}
+                onMouseLeave={() => setHighlightPinId((cur) => (cur === pin.id ? null : cur))}
+                onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setPinCtxMenu({ kind: "label", pinId: pin.id, x: e.clientX, y: e.clientY }); }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (Date.now() - dragEndedAt.current < 250) return;
+                  if (pin.border) setHighlightPinId(pin.id);
+                  setPopupPinId(pin.id === popupPinId ? null : pin.id);
+                }}
               >
                 {label}
                 <button
@@ -1305,7 +1653,7 @@ const WorldMap: React.FC<WorldMapProps> = ({
                     color: "inherit",
                     opacity: 0.6,
                   }}
-                  title="Remove label"
+                  title={t("wmap.removeLabel")}
                 >
                   ✕
                 </button>
@@ -1318,9 +1666,10 @@ const WorldMap: React.FC<WorldMapProps> = ({
             <div
               style={{
                 position: "absolute",
-                left: `${popupPin.x}%`,
-                top: `${popupPin.y}%`,
+                left: `${toScreen(popupPin.x, popupPin.y).left}px`,
+                top: `${toScreen(popupPin.x, popupPin.y).top}px`,
                 transform: "translate(-50%, 10px)",
+                transformOrigin: "center top",
                 zIndex: 30,
                 background: "var(--bg-elevated)",
                 border: "1px solid var(--border-2)",
@@ -1342,12 +1691,12 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   lineHeight: 1.55,
                   marginBottom: 10,
                   color: "var(--text)",
-                  maxHeight: 100,
-                  overflow: "hidden",
                 }}
               >
-                {popupDoc.content.replace(/\s+/g, " ").slice(0, 240)}
-                {popupDoc.content.length > 240 ? "…" : ""}
+                {(() => {
+                  const t = popupDoc.content.replace(/\s+/g, " ").trim();
+                  return t.length > 150 ? t.slice(0, 150).trimEnd() + "…" : t;
+                })()}
               </div>
               <div style={{ display: "flex", gap: 6 }}>
                 <button
@@ -1355,31 +1704,96 @@ const WorldMap: React.FC<WorldMapProps> = ({
                   onClick={() => { onOpenDoc(popupDoc.id as Id); setPopupPinId(null); }}
                   style={{ ...btnActive, fontSize: 11 }}
                 >
-                  Read more
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onRemoveDocPin(popupPin.id as Id);
-                    setPopupPinId(null);
-                    onSave();
-                  }}
-                  style={{ ...btnBase, fontSize: 11, color: "var(--danger-text)", border: "1px solid var(--danger-border-2)" }}
-                >
-                  Remove pin
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setPopupPinId(null)}
-                  style={{ ...btnBase, fontSize: 11 }}
-                >
-                  ✕
+                  {t("common.readMore")}
                 </button>
               </div>
             </div>
           )}
+
+          {/* Record (label) pin popup */}
+          {popupLabelPin && popupLabelRow && (
+            <div
+              style={{
+                position: "absolute",
+                left: `${toScreen(popupLabelPin.x, popupLabelPin.y).left}px`,
+                top: `${toScreen(popupLabelPin.x, popupLabelPin.y).top}px`,
+                transform: "translate(-50%, 16px)",
+                transformOrigin: "center top",
+                zIndex: 30,
+                background: "var(--bg-elevated)",
+                border: "1px solid var(--border-2)",
+                borderRadius: 10,
+                padding: 14,
+                maxWidth: 300,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                pointerEvents: "all",
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6, color: popupLabelCol?.color ?? "var(--text)" }}>
+                {entityLabel(popupLabelRow) || popupLabelRow.id}
+              </div>
+              {(() => {
+                const desc = String((popupLabelRow.values as any)?.description ?? "").replace(/\s+/g, " ").trim();
+                if (!desc) {
+                  return <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 10, color: "var(--text)" }}>{t("common.noDescription")}</div>;
+                }
+                return (
+                  <div style={{ fontSize: 12, opacity: 0.85, lineHeight: 1.55, marginBottom: 10, color: "var(--text)" }}>
+                    {desc.length > 150 ? desc.slice(0, 150).trimEnd() + "…" : desc}
+                  </div>
+                );
+              })()}
+              {onOpenRecord && (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    type="button"
+                    onClick={() => { onOpenRecord(popupLabelPin.collectionId, popupLabelPin.entityId); setPopupPinId(null); }}
+                    style={{ ...btnActive, fontSize: 11 }}
+                  >
+                    Read more
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
+
+      {/* Drawing hint */}
+      {drawing && (
+        <div style={{ position: "fixed", top: 72, left: "50%", transform: "translateX(-50%)", zIndex: 120, background: "var(--bg-elevated)", border: "1px solid var(--border-2)", borderRadius: 10, padding: "8px 12px", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+          <span style={{ fontSize: 12, color: "var(--text-2)" }}>{t("wmap.drawHint")}</span>
+          <button type="button" onClick={completeBorder} style={{ ...btnActive, fontSize: 12, padding: "4px 10px" }}>{t("common.finish")}</button>
+          <button type="button" onClick={cancelDrawing} style={{ ...btnBase, fontSize: 12, padding: "4px 10px" }}>{t("common.cancel")}</button>
+        </div>
+      )}
+
+      {/* Pin right-click menu */}
+      {pinCtxMenu && (() => {
+        const m = pinCtxMenu;
+        const pin = m.kind === "doc" ? docPins.find((p) => p.id === m.pinId) : labelPins.find((p) => p.id === m.pinId);
+        if (!pin) return null;
+        const hasBorder = !!(pin.border && pin.border.length >= 3);
+        const close = () => setPinCtxMenu(null);
+        const item: React.CSSProperties = { textAlign: "left", border: "none", background: "transparent", color: "var(--text-2)", cursor: "pointer", padding: "7px 10px", fontSize: 13, borderRadius: 6, whiteSpace: "nowrap" };
+        return (
+          <>
+            <div onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} style={{ position: "fixed", inset: 0, zIndex: 130 }} />
+            <div style={{ position: "fixed", top: Math.min(m.y + 4, window.innerHeight - 140), left: Math.max(8, Math.min(m.x, window.innerWidth - 200)), zIndex: 131, minWidth: 170, background: "var(--bg-elevated)", border: "1px solid var(--border-2)", borderRadius: 8, padding: 6, boxShadow: "0 10px 25px rgba(0,0,0,0.45)", display: "flex", flexDirection: "column", gap: 2 }}>
+              {hasBorder ? (
+                <button type="button" style={item} onClick={() => { close(); deleteBorder(m.kind, m.pinId); }}>{t("wmap.deleteBorder")}</button>
+              ) : (
+                <button type="button" style={item} onClick={() => { close(); startDrawBorder(m.kind, m.pinId); }}>{t("wmap.drawBorder")}</button>
+              )}
+              <button type="button" style={{ ...item, color: "var(--danger-text)" }}
+                onClick={() => { close(); if (m.kind === "doc") onRemoveDocPin(m.pinId as Id); else onRemoveLabelPin(m.pinId as Id); onSave(); }}>
+                {t("wmap.deletePin")}
+              </button>
+            </div>
+          </>
+        );
+      })()}
     </div>
   );
 };

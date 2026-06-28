@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import { supabase } from "./supabaseClient";
 
+interface BorderPoint { x: number; y: number }
+
 interface DocPin {
   id: string;
   docId: string;
   x: number;
   y: number;
+  border?: BorderPoint[];
 }
 
 interface LabelPin {
@@ -14,6 +17,7 @@ interface LabelPin {
   entityId: string;
   x: number;
   y: number;
+  border?: BorderPoint[];
 }
 
 interface WorldMapData {
@@ -95,6 +99,40 @@ const WorldMapWiki: React.FC<WorldMapWikiProps> = ({ worldMap, docs, cols, slug,
           draggable={false}
           style={{ display: "block", maxWidth: "100%", borderRadius: 10, userSelect: "none" }}
         />
+
+        {/* Region borders (read-only) */}
+        {(() => {
+          const regions = [
+            ...worldMap.docPins.map((p) => ({ kind: "doc" as const, pin: p as DocPin | LabelPin })),
+            ...worldMap.labelPins.map((p) => ({ kind: "label" as const, pin: p as DocPin | LabelPin })),
+          ].filter(({ pin }) => pin.border && pin.border.length >= 3);
+          if (regions.length === 0) return null;
+          return (
+            <svg
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", overflow: "visible" }}
+              viewBox="0 0 100 100"
+              preserveAspectRatio="none"
+            >
+              {regions.map(({ kind, pin }) => {
+                const c = kind === "label" ? (cols.find((co: any) => co.id === (pin as LabelPin).collectionId)?.color ?? "#9aa0a6") : "#9aa0a6";
+                const pts = (pin.border ?? []).map((p) => `${p.x},${p.y}`).join(" ");
+                return (
+                  <polygon
+                    key={`brd-${pin.id}`}
+                    points={pts}
+                    fill={c}
+                    fillOpacity={0.28}
+                    stroke={c}
+                    strokeOpacity={0.95}
+                    strokeWidth={2.5}
+                    strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                );
+              })}
+            </svg>
+          );
+        })()}
 
         {/* Doc pins */}
         {worldMap.docPins.map((pin) => {

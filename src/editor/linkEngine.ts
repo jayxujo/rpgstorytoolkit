@@ -1,5 +1,6 @@
 import { createEditor, $getRoot, $isTextNode, $isElementNode, $createTextNode, $createParagraphNode, type LexicalNode, type TextNode } from "lexical";
 import { HeadingNode } from "@lexical/rich-text";
+import { HorizontalRuleNode } from "@lexical/react/LexicalHorizontalRuleNode";
 import { EntityLinkNode, $createEntityLinkNode, $isEntityLinkNode } from "./EntityLinkNode";
 import type { Document as Doc, EntityLink, Id } from "../types";
 
@@ -13,7 +14,7 @@ function getHeadlessEditor() {
   if (!headless) {
     headless = createEditor({
       namespace: "linkEngine",
-      nodes: [HeadingNode, EntityLinkNode],
+      nodes: [HeadingNode, EntityLinkNode, HorizontalRuleNode],
       onError: () => {},
     });
   }
@@ -215,4 +216,46 @@ export function reconcileDocChips(doc: Doc, labelOf: LabelResolver, colorOf?: (c
   const richContent = JSON.stringify(editor.getEditorState().toJSON());
   const { text, links } = readLinksAndText(doc.id);
   return { richContent, content: text, entityLinks: links };
+}
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Find/replace plain text in a document, leaving every EntityLink chip untouched
+// (so linked text matching the search term is never altered). Returns null if there
+// was nothing to change. Operates on richContent so offsets/content stay consistent.
+export function replaceTextInDoc(
+  doc: Doc,
+  find: string,
+  replaceWith: string,
+  matchCase: boolean
+): { richContent: string; content: string; entityLinks: EntityLink[]; count: number } | null {
+  if (!find) return null;
+  const editor = getHeadlessEditor();
+  loadRichContent(doc.richContent, doc.content);
+  const re = new RegExp(escapeRegExp(find), matchCase ? "g" : "gi");
+  let count = 0;
+  editor.update(
+    () => {
+      const { nodes } = buildIndex();
+      for (const node of nodes) {
+        if ($isEntityLinkNode(node)) continue; // never touch linked text
+        const t = node.getTextContent();
+        if (!t) continue;
+        let n = 0;
+        const next = t.replace(re, () => {
+          n++;
+          return replaceWith;
+        });
+        if (n > 0) {
+          node.setTextContent(next);
+          count += n;
+        }
+      }
+    },
+    { discrete: true }
+  );
+  if (count === 0) return null;
+  const richContent = JSON.stringify(editor.getEditorState().toJSON());
+  const { text, links } = readLinksAndText(doc.id);
+  return { richContent, content: text, entityLinks: links, count };
 }

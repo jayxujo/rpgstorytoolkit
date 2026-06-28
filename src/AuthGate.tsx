@@ -3,6 +3,9 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./supabaseClient";
 import App from "./App";
 import WorldMapWiki from "./WorldMapWiki";
+import { useLang, LanguageSelect } from "./i18n";
+import { PersonaPicker } from "./PersonaPrompt";
+import { getPersona, setPersona, type PersonaId } from "./persona";
 
 type View = "app" | "auth" | "reset";
 
@@ -189,10 +192,13 @@ const AuthScreen: React.FC<{
   onBack?: () => void; // return to the app (guest keeps working)
   onGuest?: () => void; // start/continue as an anonymous guest
 }> = ({ isUpgrade = false, onBack, onGuest }) => {
+  const { t } = useLang();
   const [mode, setMode] = useState<"login" | "signup">(isUpgrade || wantsSignupFromUrl() ? "signup" : "login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  // Pre-selected from the guest's first-run answer, if any.
+  const [signupPersona, setSignupPersona] = useState<PersonaId | null>(getPersona());
 
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -246,7 +252,7 @@ const AuthScreen: React.FC<{
         return;
       }
       if (password !== confirmPassword) {
-        setError("Passwords do not match.");
+        setError(t("auth.passwordsNoMatch"));
         return;
       }
     }
@@ -291,11 +297,11 @@ const AuthScreen: React.FC<{
             setSignupComplete(true);
             setPassword("");
             setConfirmPassword("");
-            setMessage(`Account created. We sent a confirmation email to ${email}. Confirm it, then come back and log in.`);
+            setMessage(t("auth.confirmEmailSent"));
           } else {
             // If you have email confirmation OFF (or magic), you might get a session
             setSignupComplete(false);
-            setMessage("Account created and signed in.");
+            setMessage(t("auth.accountCreatedSignedIn"));
           }
         }
       } else {
@@ -303,7 +309,7 @@ const AuthScreen: React.FC<{
         if (error) throw error;
       }
     } catch (err: any) {
-      setError(err?.message ?? "Something went wrong");
+      setError(err?.message ?? t("auth.somethingWrong"));
     } finally {
       setLoading(false);
     }
@@ -313,7 +319,7 @@ const AuthScreen: React.FC<{
     setError(null);
     setMessage(null);
     if (!email) {
-      setError("Enter your email first, then click the reset link.");
+      setError(t("auth.enterEmailReset"));
       return;
     }
 
@@ -336,7 +342,7 @@ const AuthScreen: React.FC<{
     setMessage(null);
 
     if (!email) {
-      setError("Enter your email first.");
+      setError(t("auth.enterEmail"));
       return;
     }
 
@@ -365,17 +371,20 @@ const AuthScreen: React.FC<{
   return (
     <Shell>
       <Card>
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+          <LanguageSelect compact />
+        </div>
         {!(mode === "signup" && signupComplete) && (
           <>
             <h2 style={{ margin: 0, marginBottom: 6, fontSize: 18 }}>
-              {mode === "login" ? "Log in" : isUpgrade ? "Create your account" : "Sign up"}
+              {mode === "login" ? t("auth.logIn") : isUpgrade ? t("auth.createAccountTitle") : t("auth.signUp")}
             </h2>
 
             {mode === "signup" && !signupComplete && (
               <p style={{ marginTop: 0, opacity: 0.85, lineHeight: 1.4 }}>
                 {isUpgrade
-                  ? "Free to create an account. Your current work will be saved to it."
-                  : "Free to sign up and use. You can upgrade to Pro later if you want."}
+                  ? t("auth.signupNoteUpgrade")
+                  : t("auth.signupNote")}
               </p>
             )}
 
@@ -393,17 +402,17 @@ const AuthScreen: React.FC<{
             {message && <div style={{ fontSize: 12, color: "#b7d7ff" }}>{message}</div>}
             {!message && (
               <div style={{ fontSize: 12, color: "#b7d7ff" }}>
-                Account created. Check your email to confirm your address.
+                {t("auth.accountCreatedConfirm")}
               </div>
             )}
 
             <Button type="button" disabled={loading} onClick={resendConfirmation}>
-              {loading ? "Please wait…" : "Resend confirmation email"}
+              {loading ? t("auth.pleaseWait") : t("auth.resendConfirm")}
             </Button>
 
             {isUpgrade && onBack ? (
               <Button type="button" variant="ghost" disabled={loading} onClick={onBack}>
-                Back to app
+                {t("auth.backToApp")}
               </Button>
             ) : (
               <Button
@@ -419,7 +428,7 @@ const AuthScreen: React.FC<{
                   setConfirmPassword("");
                 }}
               >
-                Back to log in
+                {t("auth.backToLogin")}
               </Button>
             )}
 
@@ -429,7 +438,7 @@ const AuthScreen: React.FC<{
           <>
             <form onSubmit={onSubmit} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               <Input
-                label="Email"
+                label={t("auth.email")}
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -438,7 +447,7 @@ const AuthScreen: React.FC<{
               />
 
               <Input
-                label="Password"
+                label={t("auth.password")}
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -449,7 +458,7 @@ const AuthScreen: React.FC<{
               {mode === "signup" && (
                 <>
                   <Input
-                    label="Confirm password"
+                    label={t("auth.confirmPassword")}
                     type="password"
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
@@ -458,36 +467,43 @@ const AuthScreen: React.FC<{
                   />
 
                   <div style={{ fontSize: 12, marginTop: -2, lineHeight: 1.35 }}>
-                    <div style={{ opacity: 0.8, marginBottom: 6 }}>Password requirements</div>
+                    <div style={{ opacity: 0.8, marginBottom: 6 }}>{t("auth.passwordReqs")}</div>
 
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       <div style={{ display: "flex", gap: 8, color: pwRules.length ? "#9ef0b0" : "#aaa" }}>
                         <span style={{ width: 16, textAlign: "center" }}>{pwRules.length ? "✓" : "•"}</span>
-                        <span>At least 12 characters</span>
+                        <span>{t("auth.req12")}</span>
                       </div>
                       <div style={{ display: "flex", gap: 8, color: pwRules.lower ? "#9ef0b0" : "#aaa" }}>
                         <span style={{ width: 16, textAlign: "center" }}>{pwRules.lower ? "✓" : "•"}</span>
-                        <span>1 lowercase letter</span>
+                        <span>{t("auth.reqLower")}</span>
                       </div>
                       <div style={{ display: "flex", gap: 8, color: pwRules.upper ? "#9ef0b0" : "#aaa" }}>
                         <span style={{ width: 16, textAlign: "center" }}>{pwRules.upper ? "✓" : "•"}</span>
-                        <span>1 uppercase letter</span>
+                        <span>{t("auth.reqUpper")}</span>
                       </div>
                       <div style={{ display: "flex", gap: 8, color: pwRules.number ? "#9ef0b0" : "#aaa" }}>
                         <span style={{ width: 16, textAlign: "center" }}>{pwRules.number ? "✓" : "•"}</span>
-                        <span>1 number</span>
+                        <span>{t("auth.reqNumber")}</span>
                       </div>
                       <div style={{ display: "flex", gap: 8, color: pwRules.symbol ? "#9ef0b0" : "#aaa" }}>
                         <span style={{ width: 16, textAlign: "center" }}>{pwRules.symbol ? "✓" : "•"}</span>
-                        <span>1 symbol (e.g. !@#$)</span>
+                        <span>{t("auth.reqSymbol")}</span>
                       </div>
                     </div>
 
                     {confirmPassword.length > 0 && !passwordsMatch && (
-                      <div style={{ marginTop: 6, color: "#ff9090" }}>Passwords do not match.</div>
+                      <div style={{ marginTop: 6, color: "#ff9090" }}>{t("auth.passwordsNoMatch")}</div>
                     )}
                   </div>
                 </>
+              )}
+
+              {mode === "signup" && (
+                <div style={{ marginTop: 2 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>{t("persona.signupTitle")}</div>
+                  <PersonaPicker value={signupPersona} onChange={(id) => { setSignupPersona(id); setPersona(id); }} columns={2} />
+                </div>
               )}
 
               {mode === "signup" && (
@@ -514,9 +530,7 @@ const AuthScreen: React.FC<{
                     }}
                   />
                   <span style={{ fontSize: 12, color: "#bbb", lineHeight: 1.45 }}>
-                    Keep me updated on app improvements and news about{" "}
-                    <strong style={{ color: "#ddd" }}>Evenrift</strong> — the game this tool
-                    was built for. No spam, unsubscribe any time.
+                    {t("auth.subscribePre")}{" "}<strong style={{ color: "#ddd" }}>Evenrift</strong>{t("auth.subscribePost")}
                   </span>
                 </label>
               )}
@@ -525,7 +539,7 @@ const AuthScreen: React.FC<{
                 type="submit"
                 disabled={loading || (mode === "signup" && (!passwordIsValid || !passwordsMatch))}
               >
-                {loading ? "Please wait…" : mode === "login" ? "Log in" : "Create account"}
+                {loading ? t("auth.pleaseWait") : mode === "login" ? t("auth.logIn") : t("profile.createAccount")}
               </Button>
 
               {/* Swap: Sign up becomes the button under Log in */}
@@ -543,7 +557,7 @@ const AuthScreen: React.FC<{
                     setConfirmPassword("");
                   }}
                 >
-                  Need an account? Sign up
+                  {t("auth.needAccount")}
                 </Button>
               )}
             </form>
@@ -564,7 +578,7 @@ const AuthScreen: React.FC<{
                     fontSize: 12,
                   }}
                 >
-                  Forgot your password? Reset it
+                  {t("auth.forgotPassword")}
                 </button>
               ) : (
                 <button
@@ -587,7 +601,7 @@ const AuthScreen: React.FC<{
                     fontSize: 12,
                   }}
                 >
-                  Already have an account? Log in
+                  {t("auth.haveAccount")}
                 </button>
               )}
             </div>
@@ -599,7 +613,7 @@ const AuthScreen: React.FC<{
               <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid #2a2a2a", display: "flex", flexDirection: "column", gap: 8 }}>
                 {onBack && (
                   <Button type="button" variant="ghost" disabled={loading} onClick={onBack}>
-                    ← Back to app
+                    ← {t("auth.backToApp")}
                   </Button>
                 )}
                 {onGuest && (
@@ -617,6 +631,7 @@ const AuthScreen: React.FC<{
 };
 
 const ResetPasswordScreen = () => {
+  const { t } = useLang();
   const [pw1, setPw1] = useState("");
   const [pw2, setPw2] = useState("");
   const [resetBusy, setResetBusy] = useState(false);
@@ -643,11 +658,11 @@ const ResetPasswordScreen = () => {
     setResetMsg(null);
 
     if (!passwordIsValid) {
-      setResetMsg("Password does not meet the requirements.");
+      setResetMsg(t("reset.notMeetReqs"));
       return;
     }
     if (!passwordsMatch) {
-      setResetMsg("Passwords do not match.");
+      setResetMsg(t("auth.passwordsNoMatch"));
       return;
     }
 
@@ -657,11 +672,11 @@ const ResetPasswordScreen = () => {
       if (error) throw error;
 
       setResetComplete(true);
-      setResetMsg("Password updated. You can now log in.");
+      setResetMsg(t("reset.updated"));
       setPw1("");
       setPw2("");
     } catch (e: any) {
-      setResetMsg(e?.message ?? "Could not update password.");
+      setResetMsg(e?.message ?? t("reset.couldNotUpdate"));
     } finally {
       setResetBusy(false);
     }
@@ -680,7 +695,7 @@ const ResetPasswordScreen = () => {
           backdropFilter: "blur(10px)",
         }}
       >
-        <h1 style={{ marginTop: 0, marginBottom: 14, fontSize: 36, fontWeight: 800 }}>Reset password</h1>
+        <h1 style={{ marginTop: 0, marginBottom: 14, fontSize: 36, fontWeight: 800 }}>{t("reset.title")}</h1>
 
         {resetComplete ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -709,14 +724,14 @@ const ResetPasswordScreen = () => {
                 cursor: "pointer",
               }}
             >
-              Back to log in
+              {t("auth.backToLogin")}
             </button>
           </div>
         ) : (
           <>
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <label style={{ opacity: 0.85, fontSize: 18 }}>New password</label>
+                <label style={{ opacity: 0.85, fontSize: 18 }}>{t("reset.newPassword")}</label>
                 <input
                   type="password"
                   value={pw1}
@@ -735,7 +750,7 @@ const ResetPasswordScreen = () => {
               </div>
 
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <label style={{ opacity: 0.85, fontSize: 18 }}>Confirm new password</label>
+                <label style={{ opacity: 0.85, fontSize: 18 }}>{t("reset.confirmNewPassword")}</label>
                 <input
                   type="password"
                   value={pw2}
@@ -755,7 +770,7 @@ const ResetPasswordScreen = () => {
 
               {/* Live requirements */}
               <div style={{ marginTop: 2, fontSize: 14, opacity: 0.95, lineHeight: 1.4 }}>
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>Password requirements</div>
+                <div style={{ fontWeight: 700, marginBottom: 6 }}>{t("auth.passwordReqs")}</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <div style={{ color: pwRules.len ? "#7CFFB2" : "#ff7a7a" }}>• At least 8 characters</div>
                   <div style={{ color: pwRules.lower ? "#7CFFB2" : "#ff7a7a" }}>• At least 1 lowercase letter</div>
@@ -788,7 +803,7 @@ const ResetPasswordScreen = () => {
                   opacity: resetBusy || !passwordIsValid || !passwordsMatch ? 0.6 : 1,
                 }}
               >
-                {resetBusy ? "Updating…" : "Update password"}
+                {resetBusy ? t("reset.updating") : t("reset.updatePassword")}
               </button>
 
               {resetMsg && (
@@ -824,6 +839,7 @@ export const AuthGate: React.FC = () => {
   }, [isWikiRoute]);
 
   const PublicWiki: React.FC = () => {
+    const { t } = useLang();
     type Route =
       | { slug: string; kind: "home" }
       | { slug: string; kind: "page"; id: string }
@@ -1156,7 +1172,7 @@ export const AuthGate: React.FC = () => {
                   textUnderlineOffset: 2,
                   cursor: "pointer",
                 }}
-                title="Click to pin"
+                title={t("wiki.clickToPin")}
               >
                 {linkedText}
               </span>
@@ -1219,6 +1235,10 @@ export const AuthGate: React.FC = () => {
       const renderBlockNode = (node: any, index: number): React.ReactNode => {
         const t = String(node?.type ?? "");
         const children: any[] = Array.isArray(node?.children) ? node.children : [];
+
+        if (t === "horizontalrule") {
+          return <hr key={`block-${index}`} style={{ border: "none", borderTop: "1px solid var(--border-2)", margin: "18px 0" }} />;
+        }
 
         if (t === "heading") {
           const tag = String(node?.tag ?? "h1").toLowerCase();
@@ -1413,7 +1433,7 @@ export const AuthGate: React.FC = () => {
           <div style={{ borderRight: "1px solid var(--border-2)", background: "var(--bg-panel)", padding: 10, overflowY: "auto" }}>
             {docs.length > 0 && (
               <>
-                <div style={sectionLabelStyle}>Documents</div>
+                <div style={sectionLabelStyle}>{t("nav.documents")}</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 14 }}>
                   {renderItemTree(docs, (d) => d.folderPath ?? [], (d) => d.title || d.id, (d) => String(d.id), (id) => goto(`/${route.slug}/page/${id}`), (route.kind === "page" || route.kind === "home") ? activeDocId : "", "doc:")}
                 </div>
@@ -1422,7 +1442,7 @@ export const AuthGate: React.FC = () => {
 
             {cols.length > 0 && (
               <>
-                <div style={sectionLabelStyle}>Database</div>
+                <div style={sectionLabelStyle}>{t("nav.database")}</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                   {renderItemTree(cols, (c) => c.folderPath ?? [], (c) => c.name || c.id, (c) => String(c.id), (id) => goto(`/${route.slug}/collection/${id}`), route.kind === "collection" ? String((route as any).id) : "", "col:")}
                 </div>
@@ -1431,7 +1451,7 @@ export const AuthGate: React.FC = () => {
 
             {snapshot.worldMap?.imagePath && (
               <>
-                <div style={{ ...sectionLabelStyle, marginTop: 14 }}>World Map</div>
+                <div style={{ ...sectionLabelStyle, marginTop: 14 }}>{t("term.worldMap")}</div>
                 <button
                   type="button"
                   onClick={() => goto(`/${route.slug}/map`)}
@@ -1482,7 +1502,7 @@ export const AuthGate: React.FC = () => {
                     }
                   } else if (selected?.values && typeof selected.values === "object") {
                     for (const [k, v] of Object.entries(selected.values)) {
-                      if (k === "id" || k === "name") continue;
+                      if (k === "id" || k === "name" || k === "description") continue;
                       if (v == null || v === "") continue;
                       fields.push({ label: String(k).replace(/_/g, " "), value: String(v) });
                     }
@@ -1496,7 +1516,7 @@ export const AuthGate: React.FC = () => {
                       <div style={{ fontWeight: 900, fontSize: 15, marginBottom: 10 }}>{activeCol.name || activeCol.id}</div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                         {rows.length === 0 && (
-                          <div style={{ fontSize: 12, opacity: 0.6, padding: "6px 8px" }}>No records.</div>
+                          <div style={{ fontSize: 12, opacity: 0.6, padding: "6px 8px" }}>{t("wiki.noRecords")}</div>
                         )}
                         {rows.map((r: any) => {
                           const isSel = !!selected && String(r.id) === String(selected.id);
@@ -1544,8 +1564,20 @@ export const AuthGate: React.FC = () => {
                             {String(selected?.values?.name ?? selected.id)}
                           </div>
                           <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 16 }}>{activeCol.name || activeCol.id}</div>
+
+                          {/* Description body (rich, document-style) */}
+                          {(activeCol.descriptionEnabled !== false) && (String(selected?.descriptionRich ?? "").trim() || String(selected?.values?.description ?? "").trim()) ? (
+                            <div style={{ fontSize: 15, lineHeight: 1.7, marginBottom: 20 }}>
+                              {renderDocWithLinks({
+                                richContent: selected?.descriptionRich ?? "",
+                                content: String(selected?.values?.description ?? ""),
+                                entityLinks: selected?.descriptionLinks ?? [],
+                              })}
+                            </div>
+                          ) : null}
+
                           {fields.length === 0 ? (
-                            <div style={{ fontSize: 13, opacity: 0.6 }}>No additional details.</div>
+                            <div style={{ fontSize: 13, opacity: 0.6 }} />
                           ) : (
                             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                               {fields.map((f) => (
@@ -1560,7 +1592,7 @@ export const AuthGate: React.FC = () => {
                           )}
                         </>
                       ) : (
-                        <div style={{ fontSize: 13, opacity: 0.6 }}>Select a record to see its details.</div>
+                        <div style={{ fontSize: 13, opacity: 0.6 }}>{t("wiki.selectRecordDetails")}</div>
                       )}
                     </div>
                   </div>

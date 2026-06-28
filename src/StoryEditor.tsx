@@ -32,6 +32,8 @@ import {
 } from "lexical";
 import { HeadingNode, $createHeadingNode } from "@lexical/rich-text";
 import { $setBlocksType } from "@lexical/selection";
+import { HorizontalRuleNode, INSERT_HORIZONTAL_RULE_COMMAND } from "@lexical/react/LexicalHorizontalRuleNode";
+import { HorizontalRulePlugin } from "@lexical/react/LexicalHorizontalRulePlugin";
 import { EntityLinkNode, $isEntityLinkNode } from "./editor/EntityLinkNode";
 import { wrapRangeAsChip, collectLinksAndText } from "./editor/linkEngine";
 
@@ -366,6 +368,7 @@ interface StoryEditorProps {
 // Minimal theme
 const theme = {
   paragraph: "se-paragraph",
+  hr: "se-hr",
   heading: {
     h1: "se-h1",
     h2: "se-h2",
@@ -450,6 +453,12 @@ const ToolbarPlugin: React.FC = () => {
       </button>
       <button type="button" onClick={() => setHeading("h3")} className="toolBtn" title="Heading 3">
         H3
+      </button>
+
+      <div style={{ width: 1, height: 18, background: "var(--border)", margin: "0 2px" }} />
+
+      <button type="button" onClick={() => editor.dispatchCommand(INSERT_HORIZONTAL_RULE_COMMAND, undefined)} className="toolBtn" title="Divider">
+        <span style={{ display: "inline-block", width: 14, height: 2, background: "currentColor", borderRadius: 1, opacity: 0.85 }} />
       </button>
     </div>
   );
@@ -1812,7 +1821,7 @@ const StoryEditor: React.FC<StoryEditorProps> = ({
       namespace: "StoryEditor",
       theme,
       onError,
-      nodes: [HeadingNode, EntityLinkNode],
+      nodes: [HeadingNode, EntityLinkNode, HorizontalRuleNode],
     }),
     []
   );
@@ -1916,6 +1925,7 @@ const StoryEditor: React.FC<StoryEditorProps> = ({
       </div>
 
       <HistoryPlugin />
+      <HorizontalRulePlugin />
       <SyncExternalValuePlugin docKey={docKey} value={value} richValue={richValue} lastEmittedRichRef={lastRichRef} />
       <PreventConsecutiveEmptyParagraphsPlugin />
       <OnChangePlugin onChange={handleChange} />

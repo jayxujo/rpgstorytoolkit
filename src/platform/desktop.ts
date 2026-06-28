@@ -6,6 +6,7 @@ import { toSlug, docVaultSegments, colVaultSegments } from './slugify';
 import { richContentToMarkdown, type ResolvedLink } from './docMarkdown';
 import { buildDatasetFile } from '../dialogueExport';
 import { createSeedProject, DEFAULT_PROJECT_NAME } from './seedProject';
+import { getExperience } from '../persona';
 import type { EntityLink } from '../types';
 
 const VAULT_KEY = 'evenstory_vault_path';
@@ -547,7 +548,7 @@ export const desktopPlatform: Platform = {
       const fileExists = await fsExists(filePath);
 
       if (!fileExists) {
-        const blank = createSeedProject();
+        const blank = createSeedProject(DEFAULT_PROJECT_NAME, getExperience());
         await fsMkdir(evenstoryDir(vault));
         await fsWrite(filePath, JSON.stringify(blank, null, 2));
         // Also write the engine-readable files (documents/, tables/, dialogue/) immediately.

@@ -92,6 +92,9 @@ export function richContentToMarkdown(
   const block = (node: any): string => {
     const t = String(node?.type ?? '');
     const children: any[] = Array.isArray(node?.children) ? node.children : [];
+    if (t === 'horizontalrule') {
+      return '---';
+    }
     if (t === 'heading') {
       const tag = String(node?.tag ?? 'h1').toLowerCase();
       const level = tag === 'h1' ? '#' : tag === 'h2' ? '##' : '###';

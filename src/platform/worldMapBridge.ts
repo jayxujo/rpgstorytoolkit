@@ -35,7 +35,10 @@ export type WorldMapMutation =
   | { kind: 'addLabelPin'; collectionId: string; entityId: string; x: number; y: number }
   | { kind: 'moveLabelPin'; pinId: string; x: number; y: number }
   | { kind: 'removeLabelPin'; pinId: string }
+  | { kind: 'setDocPinBorder'; pinId: string; border: { x: number; y: number }[] | null }
+  | { kind: 'setLabelPinBorder'; pinId: string; border: { x: number; y: number }[] | null }
   | { kind: 'openDoc'; docId: string }
+  | { kind: 'openRecord'; collectionId: string; entityId: string }
   | { kind: 'save' };
 
 const STATE_EVENT = 'worldmap:state';

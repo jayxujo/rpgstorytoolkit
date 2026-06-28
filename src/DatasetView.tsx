@@ -1,4 +1,5 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useRef, useState, useEffect } from "react";
+import { useLang } from "./i18n";
 import type {
   Dataset,
   DatasetEntry,
@@ -96,7 +97,21 @@ const TypedValueInput: React.FC<{
 };
 
 const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename, onDelete, getRowLabel }) => {
+  const { t } = useLang();
   const fieldDefs = dataset.fieldDefs ?? [];
+
+  // Hide the JSON preview side panel when the view is too narrow (e.g. a squeezed
+  // dual-view panel) so the entries column keeps a usable width instead of overflowing.
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [viewWidth, setViewWidth] = useState(0);
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => setViewWidth(entries[0].contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const showJsonPreview = viewWidth === 0 || viewWidth >= 620;
 
   const recordOptions = useMemo(
     () =>
@@ -175,9 +190,9 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
           onChange={(e) => changeResultKind(entry, e.target.value as DatasetResult["kind"])}
           style={{ ...inputStyle, width: 92 }}
         >
-          <option value="text">Text</option>
-          <option value="value">Value</option>
-          <option value="column">Record column</option>
+          <option value="text">{t("cond.resText")}</option>
+          <option value="value">{t("cond.resValue")}</option>
+          <option value="column">{t("cond.resColumn")}</option>
         </select>
 
         {r.kind === "text" && (
@@ -185,7 +200,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
             type="text"
             value={r.value}
             onChange={(e) => updateEntry(entry.id, { result: { kind: "text", value: e.target.value } })}
-            placeholder="Text value"
+            placeholder={t("cond.phTextValue")}
             style={{ ...inputStyle, flex: 1, minWidth: 140 }}
           />
         )}
@@ -203,9 +218,9 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
               }}
               style={{ ...inputStyle, width: 90 }}
             >
-              <option value="string">string</option>
-              <option value="number">number</option>
-              <option value="bool">bool</option>
+              <option value="string">{t("cond.typeString")}</option>
+              <option value="number">{t("cond.typeNumber")}</option>
+              <option value="bool">{t("cond.typeBool")}</option>
             </select>
             <span style={{ opacity: 0.5 }}>=</span>
             <TypedValueInput
@@ -232,7 +247,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
                 }}
                 style={{ ...inputStyle, width: 104 }}
               >
-                <option value="">Table…</option>
+                <option value="">{t("cond.phTable")}</option>
                 {recordOptions.map((c) => (
                   <option key={c.id} value={c.id}>{c.name}</option>
                 ))}
@@ -245,7 +260,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
                 disabled={!col}
                 style={{ ...inputStyle, width: 104 }}
               >
-                <option value="">Record…</option>
+                <option value="">{t("cond.phRecord")}</option>
                 {(col?.rows ?? []).map((row) => (
                   <option key={row.id} value={row.id}>{getRowLabel(row)}</option>
                 ))}
@@ -260,7 +275,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
                 disabled={!col}
                 style={{ ...inputStyle, width: 100 }}
               >
-                <option value="">Column…</option>
+                <option value="">{t("cond.phColumn")}</option>
                 {(col?.schema ?? [])
                   .filter((f) => f.id !== "name")
                   .map((f) => (
@@ -282,40 +297,40 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
   };
 
   return (
-    <div style={{ height: "100%", padding: "12px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", minHeight: 0, gap: 10 }}>
+    <div ref={rootRef} style={{ height: "100%", padding: "12px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", minHeight: 0, gap: 10 }}>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
           <div style={{ fontWeight: 800, fontSize: 16, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {dataset.name}
           </div>
-          <button type="button" className="iconBtn" onClick={onRename} title="Rename condition">✎</button>
+          <button type="button" className="iconBtn" onClick={onRename} title={t("cond.rename")}>✎</button>
         </div>
         <button
           type="button"
           onClick={onDelete}
           style={{ borderRadius: 8, border: "1px solid var(--danger-border)", background: "var(--danger-bg)", color: "var(--danger-text)", padding: "6px 10px", cursor: "pointer", fontSize: 13 }}
         >
-          Delete condition
+          {t("cond.delete")}
         </button>
       </div>
 
       {/* Fields */}
       <div style={{ border: "1px solid var(--border-2)", borderRadius: 10, background: "var(--bg-surface)", padding: 10, flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-          <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.85 }}>Fields</div>
+          <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.85 }}>{t("cond.fields")}</div>
           <button
             type="button"
             onClick={addField}
             disabled={fieldDefs.length >= MAX_DATASET_FIELDS}
-            title={fieldDefs.length >= MAX_DATASET_FIELDS ? `Maximum of ${MAX_DATASET_FIELDS} fields` : "Add field"}
+            title={fieldDefs.length >= MAX_DATASET_FIELDS ? t("cond.maxFields") : t("cond.addFieldTitle")}
             style={{ ...inputStyle, cursor: fieldDefs.length >= MAX_DATASET_FIELDS ? "not-allowed" : "pointer", opacity: fieldDefs.length >= MAX_DATASET_FIELDS ? 0.6 : 1 }}
           >
-            + Field
+            {t("cond.addField")}
           </button>
         </div>
         {fieldDefs.length === 0 && (
-          <div style={{ fontSize: 12, opacity: 0.6 }}>No fields. Entries will index directly to a result.</div>
+          <div style={{ fontSize: 12, opacity: 0.6 }}>{t("cond.noFields")}</div>
         )}
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
           {fieldDefs.map((def, idx) => (
@@ -323,7 +338,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
               <input
                 value={def.label}
                 onChange={(e) => updateField(idx, { label: e.target.value })}
-                placeholder="Label"
+                placeholder={t("cond.label")}
                 style={{ ...inputStyle, width: 120, border: "none", background: "transparent", padding: "4px 2px" }}
               />
               <select
@@ -332,14 +347,14 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
                 onChange={(e) => updateField(idx, { type: e.target.value as DatasetFieldType })}
                 style={{ ...inputStyle, width: 84 }}
               >
-                <option value="number">number</option>
-                <option value="string">string</option>
-                <option value="bool">bool</option>
+                <option value="number">{t("cond.typeNumber")}</option>
+                <option value="string">{t("cond.typeString")}</option>
+                <option value="bool">{t("cond.typeBool")}</option>
               </select>
               <button
                 type="button"
                 onClick={() => removeField(idx)}
-                title="Remove field"
+                title={t("cond.removeField")}
                 style={{ ...inputStyle, width: 26, padding: 0, border: "1px solid var(--danger-border)", background: "var(--danger-bg)", color: "var(--danger-text)", cursor: "pointer" }}
               >
                 ✕
@@ -354,8 +369,8 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
         {/* Entries column */}
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", minHeight: 0 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.85 }}>Entries ({dataset.entries.length})</div>
-            <button type="button" onClick={addEntry} style={{ ...inputStyle, cursor: "pointer" }}>+ Entry</button>
+            <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.85 }}>{t("cond.entries")} ({dataset.entries.length})</div>
+            <button type="button" onClick={addEntry} style={{ ...inputStyle, cursor: "pointer" }}>{t("cond.addEntry")}</button>
           </div>
 
           <div style={{ flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 4, paddingRight: 4 }}>
@@ -371,7 +386,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
                 >
                   {/* Subject */}
                   <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                    <span style={{ ...segLabelStyle, width: 66 }}>Subject</span>
+                    <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.subject")}</span>
                     <select
                       className="themed-select"
                       value={entry.subjectCollectionId ?? ""}
@@ -381,28 +396,30 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
                       }}
                       style={{ ...inputStyle, width: 130 }}
                     >
-                      <option value="">(none)</option>
+                      <option value="">{t("cond.phTable")}</option>
                       {recordOptions.map((c) => (
                         <option key={c.id} value={c.id}>{c.name}</option>
                       ))}
                     </select>
-                    <select
-                      className="themed-select"
-                      value={entry.subjectEntityId ?? ""}
-                      onChange={(e) => updateEntry(entry.id, { subjectEntityId: e.target.value || undefined })}
-                      disabled={!subjCol}
-                      style={{ ...inputStyle, width: 130 }}
-                    >
-                      <option value="">(none)</option>
-                      {(subjCol?.rows ?? []).map((row) => (
-                        <option key={row.id} value={row.id}>{getRowLabel(row)}</option>
-                      ))}
-                    </select>
+                    {/* The record select only appears once a table is chosen. */}
+                    {subjCol && (
+                      <select
+                        className="themed-select"
+                        value={entry.subjectEntityId ?? ""}
+                        onChange={(e) => updateEntry(entry.id, { subjectEntityId: e.target.value || undefined })}
+                        style={{ ...inputStyle, width: 130 }}
+                      >
+                        <option value="">{t("cond.phRecord")}</option>
+                        {(subjCol.rows ?? []).map((row) => (
+                          <option key={row.id} value={row.id}>{getRowLabel(row)}</option>
+                        ))}
+                      </select>
+                    )}
 
                     <button
                       type="button"
                       onClick={() => removeEntry(entry.id)}
-                      title="Remove entry"
+                      title={t("cond.removeEntry")}
                       style={{ marginLeft: "auto", ...inputStyle, width: 26, padding: 0, border: "1px solid var(--danger-border)", background: "var(--danger-bg)", color: "var(--danger-text)", cursor: "pointer" }}
                     >
                       ✕
@@ -411,7 +428,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
 
                   {/* Condition (field values) */}
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span style={{ ...segLabelStyle, width: 66 }}>Condition</span>
+                    <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.condition")}</span>
                     {fieldDefs.length === 0 && <span style={{ fontSize: 12, opacity: 0.4 }}>(none)</span>}
                     {fieldDefs.map((def) => (
                       <label key={def.id} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, opacity: 0.85 }}>
@@ -428,7 +445,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
 
                   {/* Result */}
                   <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                    <span style={{ ...segLabelStyle, width: 66 }}>Result</span>
+                    <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.result")}</span>
                     {renderResultEditor(entry)}
                   </div>
                 </div>
@@ -437,7 +454,8 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
           </div>
         </div>
 
-        {/* Live engine JSON preview (side panel) */}
+        {/* Live engine JSON preview (side panel) — hidden when the view is narrow */}
+        {showJsonPreview && (
         <div style={{ width: "36%", minWidth: 260, maxWidth: 540, display: "flex", flexDirection: "column", minHeight: 0 }}>
           <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.85, marginBottom: 8 }}>
             conditions/{toSlug(dataset.name) || dataset.id}.json
@@ -462,6 +480,7 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
             {engineJson}
           </pre>
         </div>
+        )}
       </div>
     </div>
   );
