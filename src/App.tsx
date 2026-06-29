@@ -1055,6 +1055,13 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       setShowAssetsTree(dev);
       setShowDialogueTree(dev);
     }
+    // Always land a new user on the starter document in focus view — never on the
+    // Condition/Dialogue editor (which a stale dual/dataset layout could surface).
+    setLayoutMode("focus");
+    setFocusView("doc");
+    setActiveDatasetId(null);
+    setRecordPage(null);
+    setActiveDocId(project?.documents[0]?.id ?? "");
   };
   const assetUploadInputRef = useRef<HTMLInputElement | null>(null);
   const pendingUploadTargetRef = useRef<{ colId: Id; rowId: Id } | null>(null);

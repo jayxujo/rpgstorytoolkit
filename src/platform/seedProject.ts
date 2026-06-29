@@ -356,6 +356,10 @@ export function createSeedProject(
     // Developer experience shows the Assets + Conditions trees by default; the
     // storyteller experience hides both (Assets reveals after the first upload).
     view: {
+      // A new project always opens on the starter document in focus view —
+      // never the Condition/Dialogue editor.
+      uiLayoutMode: "focus",
+      uiFocusView: "doc",
       uiShowAssetsTree: experience === "developer",
       uiShowDialogueTree: experience === "developer",
     },

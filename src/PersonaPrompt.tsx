@@ -60,7 +60,11 @@ export const PersonaPrompt: React.FC<{ onDone: (id: PersonaId | null) => void }>
         position: "fixed",
         inset: 0,
         zIndex: 4000,
-        background: "var(--overlay-3, rgba(0,0,0,0.6))",
+        // Near-opaque so the workspace behind isn't visible — otherwise the user
+        // sees features appear/disappear as the persona changes, defeating the point.
+        background: "rgba(0,0,0,0.92)",
+        backdropFilter: "blur(10px)",
+        WebkitBackdropFilter: "blur(10px)",
         display: "grid",
         placeItems: "center",
         padding: 20,
