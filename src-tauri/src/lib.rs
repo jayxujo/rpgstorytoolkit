@@ -54,6 +54,49 @@ fn rename_path(from: String, to: String) -> Result<(), String> {
     Ok(())
 }
 
+// Recursively copies `from` into `to` (both directories), skipping symlinks.
+fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest = to.join(entry.file_name());
+        if file_type.is_symlink() {
+            continue;
+        } else if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+// Moves a directory to a new path. Tries a plain rename first (instant, same
+// filesystem); std::fs::rename can't cross filesystems/drives, so on failure
+// this falls back to a recursive copy + remove of the original. The original
+// is only removed after the copy fully succeeds, so a failed move never loses data.
+#[tauri::command]
+fn move_dir(from: String, to: String) -> Result<(), String> {
+    let from_path = Path::new(&from);
+    let to_path = Path::new(&to);
+    if !from_path.exists() {
+        return Err("Source folder does not exist".into());
+    }
+    if to_path.exists() {
+        return Err("Destination already exists".into());
+    }
+    if fs::rename(from_path, to_path).is_ok() {
+        return Ok(());
+    }
+    if let Err(e) = copy_dir_recursive(from_path, to_path) {
+        let _ = fs::remove_dir_all(to_path);
+        return Err(e.to_string());
+    }
+    fs::remove_dir_all(from_path)
+        .map_err(|e| format!("Copied to the new location but failed to remove the original: {e}"))
+}
+
 #[tauri::command]
 fn trash_path(path: String) -> Result<(), String> {
     let p = Path::new(&path);
@@ -138,6 +181,7 @@ pub fn run() {
             write_file_base64,
             delete_file,
             rename_path,
+            move_dir,
             trash_path,
             prune_empty_dirs,
             list_dir,

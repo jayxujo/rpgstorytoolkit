@@ -43,6 +43,7 @@ import {
   pickVaultFolder,
   createVaultFolder,
   renameVaultFolder,
+  moveVaultFolder,
   NOT_A_VAULT_ERROR,
   getRecentVaults,
   removeRecentVault,
@@ -3933,6 +3934,41 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     } finally {
       setVaultPickerBusy(false);
       setLoadingInit(false);
+    }
+  };
+
+  // Move the current vault folder to a new location on disk. The project stays
+  // open; only the on-disk path (and projectRowId, which IS that path on desktop)
+  // changes, mirroring the rename flow in commitProjectName.
+  const moveVaultFolderHandler = async () => {
+    setFileMenuOpen(false);
+    if (isDirty) {
+      const ok = await appModal.confirm({
+        title: t("dlg.unsavedChanges"),
+        message: t("dlg.unsavedSwitchMsg"),
+        confirmText: t("dlg.saveContinue"),
+        cancelText: t("dlg.continueWithoutSaving"),
+      });
+      if (ok) await saveProjectToSupabase();
+    }
+    setVaultPickerBusy(true);
+    try {
+      const newPath = await moveVaultFolder();
+      if (!newPath) return;
+      setProjectRowId(newPath);
+      setRecentVaults(getRecentVaults());
+      // sync.json travels with the folder, but the cached sync badges are keyed
+      // by the old path — re-derive them under the new path so the launcher/
+      // switcher don't show a stale "Local" badge before their own next refresh.
+      await refreshVaultSyncStatus();
+    } catch (e: any) {
+      const msg =
+        e?.message === "ALREADY_HERE" ? t("file.moveAlreadyHere") :
+        e?.message === "MOVE_INTO_SELF" ? t("file.moveIntoSelf") :
+        (e?.message ?? "Failed to move project folder.");
+      appModal.alert(msg, { title: "Move project" });
+    } finally {
+      setVaultPickerBusy(false);
     }
   };
 
@@ -9108,6 +9144,25 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                     <div style={{ fontSize: 11, color: "var(--text-2)", padding: "0 10px 6px", opacity: 0.7, wordBreak: "break-all" }}>
                       {getVaultPath() ?? t("file.notSet")}
                     </div>
+                    <button
+                      type="button"
+                      disabled={vaultPickerBusy}
+                      onClick={moveVaultFolderHandler}
+                      style={{
+                        width: "100%",
+                        borderRadius: 8,
+                        border: "1px solid var(--border-3)",
+                        backgroundColor: "transparent",
+                        color: "var(--text-2)",
+                        cursor: "pointer",
+                        padding: "8px 10px",
+                        fontSize: 13,
+                        textAlign: "left",
+                        marginBottom: 6,
+                      }}
+                    >
+                      {vaultPickerBusy ? t("file.opening") : t("file.moveProject")}
+                    </button>
                     <button
                       type="button"
                       disabled={vaultPickerBusy}

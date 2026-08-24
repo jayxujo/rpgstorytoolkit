@@ -199,6 +199,47 @@ export async function renameVaultFolder(newName: string): Promise<string | null>
   }
 }
 
+// True if `path` is `ancestor` itself or nested somewhere inside it.
+function isWithin(path: string, ancestor: string): boolean {
+  const a = ancestor.replace(/[/\\]+$/, '') + '/';
+  const p = path.replace(/[/\\]+$/, '') + '/';
+  return p === a || p.startsWith(a);
+}
+
+// Move the vault folder to an entirely new location on disk. The user picks the
+// new PARENT folder (not the vault itself, matching createVaultFolder/pickVaultFolder);
+// we keep the same folder name inside it, deduped if one already exists there.
+// Rust falls back to copy+delete when the destination is on a different
+// filesystem/drive (plain rename can't cross devices). Returns the new vault
+// root, or null if cancelled. Throws 'ALREADY_HERE' / 'MOVE_INTO_SELF' for those
+// specific invalid picks so the caller can show a friendly message.
+export async function moveVaultFolder(): Promise<string | null> {
+  const current = getVaultPath();
+  if (!current) return null;
+
+  const selected = await open({ directory: true, multiple: false });
+  if (!selected || Array.isArray(selected)) return null;
+  const newParent = (selected as string).replace(/[/\\]+$/, '');
+
+  if (newParent === parentDir(current)) throw new Error('ALREADY_HERE');
+  if (isWithin(newParent, current)) throw new Error('MOVE_INTO_SELF');
+
+  const name = basename(current);
+  let target = name;
+  for (let n = 2; await fsExists(joinPath(newParent, target)); n++) {
+    target = `${name} ${n}`;
+  }
+  const newPath = joinPath(newParent, target);
+
+  await invoke('move_dir', { from: current, to: newPath });
+
+  const prevName = getRecentVaults().find((v) => v.path === current)?.name;
+  removeRecentVault(current);
+  setVaultPath(newPath);
+  addRecentVault(newPath, prevName);
+  return newPath;
+}
+
 // Open a previously-used vault. Returns false if it can no longer be found.
 export async function openRecentVault(path: string): Promise<boolean> {
   if (!(await vaultExists(path))) return false;

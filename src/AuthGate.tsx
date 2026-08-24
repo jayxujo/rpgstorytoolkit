@@ -1768,15 +1768,24 @@ export const AuthGate: React.FC = () => {
     let mounted = true;
 
     const init = async () => {
+      // Desktop is local-first and offline-capable: it renders <App/> regardless
+      // of the web session (App manages its own optional sync account). Never block
+      // startup on a network auth call here — offline, supabase.auth.getSession()
+      // can hang indefinitely refreshing an expired token, which would leave the
+      // splash spinning until connectivity returns.
+      const isDesktopEnv = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+      if (isDesktopEnv) {
+        setLoading(false);
+        return;
+      }
+
       const { data } = await supabase.auth.getSession();
       if (!mounted) return;
       let s = data.session ?? null;
 
       // No session and not on a public route → silently sign in as a guest.
-      // Desktop is local-first and offline-capable, so it never auto-signs-in;
-      // it manages an optional web account itself (for sync).
-      const isDesktopEnv = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-      if (!s && !isWikiRoute && !isDesktopEnv && getAuthModeFromUrl() === "app") {
+      // (Desktop already returned above.)
+      if (!s && !isWikiRoute && getAuthModeFromUrl() === "app") {
         try {
           const { data: anon, error } = await supabase.auth.signInAnonymously();
           if (error) throw error;
