@@ -1,5 +1,6 @@
 // Timeline.tsx
 import React from "react";
+import { DndContext, DragOverlay, PointerSensor, useDraggable, useDroppable, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { useAppModal } from "./AppModal";
 import { useLang } from "./i18n";
 import type { Collection, CollectionRow, Document, Id, TimelineLineDoc, TimelineLinePin } from "./types";
@@ -9,6 +10,37 @@ type TimelineEntityLabel = {
   position: number;
   collectionId: Id;
   entityId: Id;
+};
+
+// Section drop target. dnd-kit (pointer events) rather than native HTML5 drag, which the
+// Tauri webview swallows, so moving docs between sections works on desktop too.
+const TimelineSlot: React.FC<{ beat: number; children: React.ReactNode }> = ({ beat, children }) => {
+  const { setNodeRef, isOver } = useDroppable({ id: `beat:${beat}` });
+  return (
+    <div ref={setNodeRef} className={isOver ? "timelineSlot timelineSlotOver" : "timelineSlot"}>
+      {children}
+    </div>
+  );
+};
+
+const TimelineDocChip: React.FC<{ docId: Id; title: string; onClick: () => void; children: React.ReactNode }> = ({ docId, title, onClick, children }) => {
+  const { setNodeRef, attributes, listeners, isDragging } = useDraggable({ id: docId });
+  return (
+    <div
+      ref={setNodeRef}
+      {...attributes}
+      {...listeners}
+      className="timelineDocChip"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      title={title}
+      style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8, opacity: isDragging ? 0.4 : 1, touchAction: "none" }}
+    >
+      {children}
+    </div>
+  );
 };
 
 interface TimelineProps {
@@ -110,9 +142,9 @@ export default function Timeline({
   const lineMode = style === "line" && !!onSetStyle;
   const [editingSection, setEditingSection] = React.useState<number | null>(null);
   const [sectionDraft, setSectionDraft] = React.useState("");
+  const [draggingDocId, setDraggingDocId] = React.useState<Id | null>(null);
+  const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   if (!enabled) return null;
-
-  const isDesktop = "__TAURI_INTERNALS__" in window;
 
   const sectionTitleFor = (beat: number) => (sectionTitles?.[beat]?.trim() || `${t("tl.sectionWord")} ${beat + 1}`);
 
@@ -218,16 +250,13 @@ export default function Timeline({
     onRemoveBeat(beat);
   };
 
-  const onDragStartDoc = (e: React.DragEvent, docId: Id) => {
-    e.dataTransfer.setData("text/plain", String(docId));
-    e.dataTransfer.effectAllowed = "move";
-  };
-
-  const onDropOnBeat = (e: React.DragEvent, beat: number) => {
-    e.preventDefault();
-    const docId = e.dataTransfer.getData("text/plain") as Id;
-    if (!docId) return;
-    onMoveDoc(docId, beat);
+  const onDocDragEnd = ({ active, over }: DragEndEvent) => {
+    setDraggingDocId(null);
+    const target = typeof over?.id === "string" && over.id.startsWith("beat:") ? Number(over.id.slice(5)) : NaN;
+    if (Number.isNaN(target)) return;
+    const doc = documents.find((d) => d.id === active.id);
+    if (!doc || doc.timelinePos === target) return;
+    onMoveDoc(doc.id, target);
   };
 
   const labelPillStyle = (colColor?: string): React.CSSProperties => ({
@@ -333,6 +362,12 @@ export default function Timeline({
           onSelectEntity={onSelectEntity}
         />
       ) : (
+      <DndContext
+        sensors={dndSensors}
+        onDragStart={({ active }) => setDraggingDocId(String(active.id))}
+        onDragEnd={onDocDragEnd}
+        onDragCancel={() => setDraggingDocId(null)}
+      >
       <div className="timelineScroller" style={{ flex: 1, minHeight: 0 }}>
         <div className="timelineGrid">
           {beats.map((beat) => {
@@ -340,12 +375,7 @@ export default function Timeline({
             const beatDocs = docsByBeat.get(beat) ?? [];
 
             return (
-              <div
-                key={beat}
-                className="timelineSlot"
-                onDragOver={(e) => e.preventDefault()}
-                onDrop={(e) => onDropOnBeat(e, beat)}
-              >
+              <TimelineSlot key={beat} beat={beat}>
                 {timelineCovers[beat] && (
                   <div style={{ position: "relative", marginBottom: 6 }}>
                     <img
@@ -525,8 +555,7 @@ export default function Timeline({
                   </div>
                 )}
 
-                {(beatDocs.length > 0 || !isDesktop) && (
-                  <div className="timelineDocs">
+                <div className="timelineDocs">
                     {beatDocs.length === 0 ? (
                       <div className="timelineEmpty">
                         <div className="timelineEmptyDot" />
@@ -534,18 +563,7 @@ export default function Timeline({
                       </div>
                     ) : (
                       beatDocs.map((d) => (
-                        <div
-                          key={d.id}
-                          className="timelineDocChip"
-                          draggable={!isDesktop}
-                          onDragStart={!isDesktop ? (e) => onDragStartDoc(e, d.id) : undefined}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onOpenDoc(d.id);
-                          }}
-                          title={isDesktop ? t("tl.clickToOpen") : t("tl.dragOrOpen")}
-                          style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}
-                        >
+                        <TimelineDocChip key={d.id} docId={d.id} title={t("tl.dragOrOpen")} onClick={() => onOpenDoc(d.id)}>
                           <span
                             style={{
                               flex: 1,
@@ -570,11 +588,10 @@ export default function Timeline({
                           >
                             ✕
                           </button>
-                        </div>
+                        </TimelineDocChip>
                       ))
                     )}
                   </div>
-                )}
 
                 {/* Per-section add controls */}
                 <div className="timelineAddRow">
@@ -685,11 +702,19 @@ export default function Timeline({
                     </label>
                   )}
                 </div>
-              </div>
+              </TimelineSlot>
             );
           })}
         </div>
       </div>
+      <DragOverlay>
+        {draggingDocId ? (
+          <div className="timelineDocChip" style={{ cursor: "grabbing", boxShadow: "0 6px 18px rgba(0,0,0,0.25)" }}>
+            {documents.find((d) => d.id === draggingDocId)?.title}
+          </div>
+        ) : null}
+      </DragOverlay>
+      </DndContext>
       )}
     </div>
   );

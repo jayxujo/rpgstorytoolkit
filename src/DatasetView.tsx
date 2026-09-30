@@ -1,5 +1,8 @@
 import React, { useMemo, useRef, useState, useEffect } from "react";
 import { useLang } from "./i18n";
+import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
+import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import type {
   Dataset,
   DatasetEntry,
@@ -19,6 +22,7 @@ import {
   ensureFieldValues,
 } from "./datasetFields";
 import { buildDatasetFile } from "./dialogueExport";
+import LinkedTextField, { type LinkableRecord } from "./editor/LinkedTextField";
 import { toSlug } from "./platform/slugify";
 import type { Project } from "./types";
 
@@ -96,6 +100,41 @@ const TypedValueInput: React.FC<{
   );
 };
 
+// One draggable entry card. Only the handle starts a drag, so the inputs inside stay usable.
+const SortableEntryCard: React.FC<{ id: Id; children: React.ReactNode }> = ({ id, children }) => {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id });
+  const handle = (
+    <button
+      type="button"
+      ref={setActivatorNodeRef}
+      {...attributes}
+      {...listeners}
+      title="Drag to reorder"
+      aria-label="Drag to reorder"
+      style={{ position: "absolute", left: 2, top: 0, bottom: 0, width: 18, border: "none", background: "transparent", color: "var(--text-3)", cursor: isDragging ? "grabbing" : "grab", padding: 0, fontSize: 14, lineHeight: 1, touchAction: "none" }}
+    >
+      ⠿
+    </button>
+  );
+  return (
+    <div
+      ref={setNodeRef}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        position: "relative",
+        zIndex: isDragging ? 1 : undefined,
+        opacity: isDragging ? 0.85 : 1,
+        boxShadow: isDragging ? "0 6px 18px rgba(0,0,0,0.25)" : undefined,
+        border: "1px solid var(--border-2)", borderRadius: 8, background: "var(--bg-panel)", padding: "8px 10px 8px 22px", display: "flex", flexDirection: "column", gap: 6,
+      }}
+    >
+      {handle}
+      {children}
+    </div>
+  );
+};
+
 const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename, onDelete, getRowLabel }) => {
   const { t } = useLang();
   const fieldDefs = dataset.fieldDefs ?? [];
@@ -121,6 +160,22 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
         rows: c.rows,
       })),
     [collections]
+  );
+
+  // Records offered when linking text in a result ("/" search or the link button).
+  const linkableRecords = useMemo<LinkableRecord[]>(
+    () =>
+      collections.flatMap((c) =>
+        c.rows.map((row) => ({
+          collectionId: c.id,
+          collectionName: c.name,
+          color: c.color,
+          entityId: row.id,
+          displayId: String(row.values["id"] ?? ""),
+          label: getRowLabel(row),
+        }))
+      ),
+    [collections, getRowLabel]
   );
 
   // Live preview of the engine-readable JSON this condition exports.
@@ -168,6 +223,19 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
   const removeEntry = (id: Id) =>
     onChange({ ...dataset, entries: dataset.entries.filter((e) => e.id !== id) });
 
+  // Reordering entries reorders the engine file too (buildDatasetFile keeps array order).
+  const entrySensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+  const onEntryDragEnd = ({ active, over }: DragEndEvent) => {
+    if (!over || active.id === over.id) return;
+    const from = dataset.entries.findIndex((e) => e.id === active.id);
+    const to = dataset.entries.findIndex((e) => e.id === over.id);
+    if (from < 0 || to < 0) return;
+    onChange({ ...dataset, entries: arrayMove(dataset.entries, from, to) });
+  };
+
   // Change a result's kind, preserving sensible defaults.
   const changeResultKind = (entry: DatasetEntry, kind: DatasetResult["kind"]) => {
     let result: DatasetResult;
@@ -196,12 +264,18 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
         </select>
 
         {r.kind === "text" && (
-          <input
-            type="text"
+          <LinkedTextField
+            fieldKey={entry.id}
             value={r.value}
-            onChange={(e) => updateEntry(entry.id, { result: { kind: "text", value: e.target.value } })}
+            richValue={r.richValue}
+            records={linkableRecords}
+            onChange={({ value, richValue, links }) =>
+              updateEntry(entry.id, {
+                result: links.length ? { kind: "text", value, richValue, links } : { kind: "text", value },
+              })
+            }
             placeholder={t("cond.phTextValue")}
-            style={{ ...inputStyle, flex: 1, minWidth: 140 }}
+            style={{ ...inputStyle, height: "auto", minHeight: 28, padding: 0, flex: 1, minWidth: 140 }}
           />
         )}
 
@@ -377,13 +451,12 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
             {dataset.entries.length === 0 && (
               <div style={{ fontSize: 12, opacity: 0.6, padding: "8px 0" }}>No entries yet. Add one to map fields to a result.</div>
             )}
+            <DndContext sensors={entrySensors} collisionDetection={closestCenter} onDragEnd={onEntryDragEnd}>
+            <SortableContext items={dataset.entries.map((e) => e.id)} strategy={verticalListSortingStrategy}>
             {dataset.entries.map((entry) => {
               const subjCol = collections.find((c) => c.id === entry.subjectCollectionId);
               return (
-                <div
-                  key={entry.id}
-                  style={{ border: "1px solid var(--border-2)", borderRadius: 8, background: "var(--bg-panel)", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6 }}
-                >
+                <SortableEntryCard key={entry.id} id={entry.id}>
                   {/* Subject */}
                   <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                     <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.subject")}</span>
@@ -448,9 +521,11 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
                     <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.result")}</span>
                     {renderResultEditor(entry)}
                   </div>
-                </div>
+                </SortableEntryCard>
               );
             })}
+            </SortableContext>
+            </DndContext>
           </div>
         </div>
 

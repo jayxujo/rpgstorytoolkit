@@ -106,7 +106,9 @@ export interface DatasetFieldDef {
 //  - "column": a value written to a specific record's column; its type follows
 //              that column (string/number/bool). Reads like "<record>.<field> = value".
 export type DatasetResult =
-  | { kind: "text"; value: string }
+  // `value` is the plain text. When it holds record links, `richValue` (Lexical JSON
+  // with EntityLink chips) is the source of truth and `links` its offset index.
+  | { kind: "text"; value: string; richValue?: string; links?: EntityLink[] }
   | { kind: "value"; valueType: DatasetFieldType; value: string | number }
   | { kind: "column"; collectionId: Id; entityId: Id; fieldId: Id; value: string | number };
 
@@ -318,6 +320,10 @@ export interface Project {
   worldMapDocPins?: WorldMapDocPin[];
   worldMapLabelPins?: WorldMapLabelPin[];
   worldMaps?: WorldMapEntry[]; // archive of all saved maps (incl. the active one)
+
+  // Set on the WEB copy each time a desktop app pushes it, so the web app can show
+  // "also on desktop, last synced …".
+  desktopSync?: { at: string };
 }
 
 export type Profile = {

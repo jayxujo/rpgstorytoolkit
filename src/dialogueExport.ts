@@ -33,7 +33,24 @@ export interface DatasetFile {
 
 function serializeResult(project: Project, r: DatasetResult | undefined): any {
   if (!r) return { kind: "value", type: "string", value: "" };
-  if (r.kind === "text") return { kind: "text", value: String(r.value ?? "") };
+  if (r.kind === "text") {
+    const value = String(r.value ?? "");
+    const links = (r.links ?? [])
+      .filter((l) => l.end > l.start)
+      .map((l) => {
+        const col = project.collections.find((c) => c.id === l.collectionId);
+        const row = col?.rows.find((rr) => rr.id === l.entityId);
+        return {
+          text: value.slice(l.start, l.end),
+          start: l.start,
+          end: l.end,
+          collection: col?.name ?? l.collectionId,
+          record: row ? String(row.values["id"] || row.id) : l.entityId,
+        };
+      });
+    // `links` only when the text references records, so plain results keep their shape.
+    return links.length ? { kind: "text", value, links } : { kind: "text", value };
+  }
   if (r.kind === "value") {
     return { kind: "value", type: r.valueType, value: coerceTyped(r.valueType, r.value) };
   }

@@ -327,6 +327,90 @@ export async function setVaultSyncMeta(meta: VaultSyncMeta, vault?: string): Pro
   await fsWrite(joinPath(evenstoryDir(v), "sync.json"), JSON.stringify(meta, null, 2));
 }
 
+// The project as it was at the last sync, in both forms (desktop + web asset paths).
+// The baseline for the item-by-item merge (syncMerge.ts). Local file only.
+export interface VaultSyncBase {
+  local: Project;
+  web: Project;
+}
+
+export async function getVaultSyncBase(vault?: string): Promise<VaultSyncBase | null> {
+  const v = vault ?? getVaultPath();
+  if (!v) return null;
+  const path = joinPath(evenstoryDir(v), "sync-base.json");
+  try {
+    if (!(await fsExists(path))) return null;
+    const base = JSON.parse(await fsRead(path)) as VaultSyncBase;
+    return base?.local && base?.web ? base : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setVaultSyncBase(base: VaultSyncBase, vault?: string): Promise<void> {
+  const v = vault ?? getVaultPath();
+  if (!v) return;
+  await fsMkdir(evenstoryDir(v));
+  await fsWrite(joinPath(evenstoryDir(v), "sync-base.json"), JSON.stringify(base));
+}
+
+// ── Local backups (.evenstory/backups) ─────────────────────────────────────
+// Written before sync overwrites/merges so a sync can always be undone. Project
+// data only (asset files are never deleted by a sync). The newest MAX are kept.
+const MAX_BACKUPS = 10;
+
+export interface VaultBackup {
+  file: string;   // e.g. 2026-09-30T10-11-12-000Z_before-pull.json
+  date: Date;
+  reason: string; // e.g. "before-pull"
+}
+
+export async function writeVaultBackup(project: Project, reason: string, vault?: string): Promise<void> {
+  const v = vault ?? getVaultPath();
+  if (!v) return;
+  const dir = joinPath(evenstoryDir(v), "backups");
+  await fsMkdir(dir);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  await fsWrite(joinPath(dir, `${stamp}_${reason}.json`), JSON.stringify(project));
+  const all = await listVaultBackups(v);
+  for (const old of all.slice(MAX_BACKUPS)) {
+    await invoke('delete_file', { path: joinPath(dir, old.file) }).catch(() => {});
+  }
+}
+
+// Newest first.
+export async function listVaultBackups(vault?: string): Promise<VaultBackup[]> {
+  const v = vault ?? getVaultPath();
+  if (!v) return [];
+  let names: string[] = [];
+  try {
+    names = await invoke<string[]>('list_dir', { path: joinPath(evenstoryDir(v), "backups") });
+  } catch {
+    return [];
+  }
+  return names
+    .filter((n) => n.endsWith(".json"))
+    .map((file) => {
+      const m = file.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_(.+)\.json$/);
+      const date = m ? new Date(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`) : new Date(0);
+      return { file, date, reason: m?.[6] ?? "" };
+    })
+    .sort((a, b) => b.file.localeCompare(a.file));
+}
+
+export async function readVaultBackup(file: string, vault?: string): Promise<Project> {
+  const v = vault ?? getVaultPath();
+  if (!v) throw new Error("No project open.");
+  return JSON.parse(await fsRead(joinPath(evenstoryDir(v), "backups", file))) as Project;
+}
+
+// Whether an asset (vault storage path, as stored on AssetFile.path) exists on disk.
+export async function vaultAssetExists(storagePath: string, vault?: string): Promise<boolean> {
+  const v = vault ?? getVaultPath();
+  if (!v || !storagePath) return false;
+  return fsExists(vaultAssetPath(v, storagePath)).catch(() => false);
+}
+
 // ── Asset helpers ──────────────────────────────────────────────────────────
 
 function vaultAssetPath(vault: string, storagePath: string): string {

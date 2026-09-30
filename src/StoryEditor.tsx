@@ -913,6 +913,9 @@ const SlashLinkTypeaheadPlugin: React.FC<{
   const [anchorRect, setAnchorRect] = React.useState<{ left: number; top: number } | null>(null);
 
   const triggerStartRef = React.useRef<number | null>(null); // global index of "/"
+  // End of the text the chosen record replaces: the caret, extended over a word that
+  // directly follows it (typing "/" before "Essence" searches for and replaces "Essence").
+  const triggerEndRef = React.useRef<number | null>(null);
   const lastCursorRef = React.useRef<number | null>(null);
   const dismissedSlashPosRef = React.useRef<number | null>(null); // user-dismissed slash trigger position
 
@@ -922,6 +925,7 @@ const SlashLinkTypeaheadPlugin: React.FC<{
     setActiveIndex(0);
     setAnchorRect(null);
     triggerStartRef.current = null;
+    triggerEndRef.current = null;
   }, []);
 
   const isInsideExistingLink = React.useCallback(
@@ -1176,10 +1180,11 @@ const SlashLinkTypeaheadPlugin: React.FC<{
       const cursor = lastCursorRef.current;
 
       if (triggerStart == null || cursor == null) return;
+      const replaceEnd = Math.max(cursor, triggerEndRef.current ?? cursor);
 
       editor.update(() => {
         const replacement = `${it.label || it.entityId}`;
-        const newText = replaceGlobalRange(triggerStart, cursor, replacement);
+        const newText = replaceGlobalRange(triggerStart, replaceEnd, replacement);
         if (newText == null) return;
 
         const start = triggerStart;
@@ -1264,8 +1269,11 @@ const SlashLinkTypeaheadPlugin: React.FC<{
   React.useEffect(() => {
     if (!enabled) return;
 
-    return editor.registerUpdateListener(({ editorState }) => {
-      editorState.read(() => {
+    return editor.registerUpdateListener(() => {
+      // editor.read (not editorState.read): the DOM-mapping helpers used here
+      // ($getNearestNodeFromDOMNode) need an active editor. Without one, a caret on an
+      // empty line threw, aborting the remaining update listeners (stale text + blank app).
+      editor.read(() => {
         const root = $getRoot();
         const fullText = root.getTextContent();
         const cursor = computeCursorIndex();
@@ -1344,8 +1352,16 @@ const SlashLinkTypeaheadPlugin: React.FC<{
           return;
         }
 
+        // A word right after the caret (e.g. "/" typed before "Essence") joins the query
+        // and is replaced along with it. Never reaches into an existing link.
+        const tail = isInsideExistingLink(cursor)
+          ? ""
+          : (fullText.slice(cursor).match(/^[^\s.,;:!?()[\]{}"'`/]+/)?.[0] ?? "");
+        const tailSafe = tail && !existingLinks.some((l) => l.start < cursor + tail.length && l.end > cursor) ? tail : "";
+
         triggerStartRef.current = slashPos;
-        setQuery(rawQuery);
+        triggerEndRef.current = cursor + tailSafe.length;
+        setQuery(rawQuery + tailSafe);
 
         const rect = computeCaretRect();
         if (rect) setAnchorRect(rect);
@@ -1356,7 +1372,7 @@ const SlashLinkTypeaheadPlugin: React.FC<{
         }
       });
     });
-  }, [editor, enabled, open, closeMenu, computeCursorIndex, computeCaretRect, isInsideExistingLink]);
+  }, [editor, enabled, open, closeMenu, computeCursorIndex, computeCaretRect, isInsideExistingLink, existingLinks]);
 
   // Close on outside click
   React.useEffect(() => {
@@ -1555,8 +1571,11 @@ const QuoteDialogueLinkTypeaheadPlugin: React.FC<{
       return;
     }
 
-    return editor.registerUpdateListener(({ editorState }) => {
-      editorState.read(() => {
+    return editor.registerUpdateListener(() => {
+      // editor.read (not editorState.read): the DOM-mapping helpers used here
+      // ($getNearestNodeFromDOMNode) need an active editor. Without one, a caret on an
+      // empty line threw, aborting the remaining update listeners (stale text + blank app).
+      editor.read(() => {
         const selection = $getSelection();
         if (!$isRangeSelection(selection) || !selection.isCollapsed()) {
           if (open) closeMenu();

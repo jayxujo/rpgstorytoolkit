@@ -13,6 +13,8 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import type {
   Project,
   Document as Doc,
@@ -52,8 +54,15 @@ import {
   vaultExists,
   getVaultSyncMeta,
   setVaultSyncMeta,
+  getVaultSyncBase,
+  setVaultSyncBase,
+  writeVaultBackup,
+  listVaultBackups,
+  readVaultBackup,
+  vaultAssetExists,
   type RecentVault,
 } from "./platform";
+import { mergeProjects, DEVICE_VIEW_KEYS, type MergeConflict } from "./syncMerge";
 import { webPlatform } from "./platform/web";
 import { createSeedProject } from "./platform/seedProject";
 import type { ProjectSummary } from "./platform/types";
@@ -310,12 +319,7 @@ const syncContentString = (p: Project): string => {
   let v = view;
   if (view && typeof view === "object") {
     v = { ...view };
-    for (const k of [
-      "uiLayoutMode", "uiFocusView", "uiShowAssetsTree", "uiShowDialogueTree",
-      "uiShowLeftPanel", "uiShowMiddlePanel", "uiShowRightPanel",
-      "uiPanelSizes", "uiTimelineHeight", "uiCollapsedDocumentGroups",
-      "uiCollapsedCollectionGroups", "uiColumnWidths", "activeDatasetId",
-    ]) delete (v as any)[k];
+    for (const k of DEVICE_VIEW_KEYS) delete (v as any)[k];
   }
   return JSON.stringify({ ...rest, view: v });
 };
@@ -610,6 +614,44 @@ const TreeRow: React.FC<{
   );
 };
 
+// Table row that can be reordered by dragging its handle (dnd-kit, so it works in the
+// Tauri webview too, where native HTML5 drag-and-drop is swallowed by the window).
+type RowDragHandle = {
+  ref: (el: HTMLElement | null) => void;
+  props: Record<string, unknown>;
+  isDragging: boolean;
+};
+const SortableTableRow: React.FC<{
+  id: Id;
+  rowKey: string;
+  selected: boolean;
+  onClick: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+  children: (handle: RowDragHandle) => React.ReactNode;
+}> = ({ id, rowKey, selected, onClick, onContextMenu, children }) => {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id });
+  return (
+    <tr
+      ref={setNodeRef}
+      data-rowkey={rowKey}
+      onClick={onClick}
+      onContextMenu={onContextMenu}
+      style={{
+        transform: CSS.Translate.toString(transform),
+        transition,
+        position: "relative",
+        zIndex: isDragging ? 2 : undefined,
+        background: isDragging ? "var(--bg-row-drag)" : selected ? "var(--bg-row-sel)" : undefined,
+        boxShadow: isDragging ? "0 6px 18px rgba(0,0,0,0.25)" : undefined,
+        cursor: "pointer",
+        opacity: isDragging ? 0.85 : 1,
+      }}
+    >
+      {children({ ref: setActivatorNodeRef, props: { ...attributes, ...listeners }, isDragging })}
+    </tr>
+  );
+};
+
 // Droppable container representing the root (drop here to move to top level).
 const TreeRootDroppable: React.FC<{ id: string; children: React.ReactNode }> = ({ id, children }) => {
   const { setNodeRef, isOver } = useDroppable({ id });
@@ -767,6 +809,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const [isOffline, setIsOffline] = useState(typeof navigator !== "undefined" && !navigator.onLine);
   // True when the linked web project has been updated more recently than our last sync.
   const [webHasNewer, setWebHasNewer] = useState(false);
+  // Web: dismissed the "also on desktop" notice (per project, this browser session).
+  const [desktopNoticeDismissed, setDesktopNoticeDismissed] = useState<Record<string, boolean>>({});
 
   /** ---------- Profile ---------- */
   const [profile, setProfile] = useState<ProfileRow | null>(null);
@@ -1390,8 +1434,6 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const columnWidthsLoadedForProject = useRef<Id | null>(null);
   const activeResizeRef = useRef<{ fieldKey: string; startX: number; startWidth: number } | null>(null);
 
-  const [draggingRowId, setDraggingRowId] = useState<Id | null>(null);
-  const [dragOverRowId, setDragOverRowId] = useState<Id | null>(null);
 
   // Layout: "focus" shows the sidebar + one editor (story OR collection); "dual"
   // shows both side by side. The sidebar is always present.
@@ -2737,7 +2779,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     return mapOldToNew[idx] ?? 0;
   };
 
-  const normalizeLoadedProject = (raw: any): Project => {
+  // `keepAssetPaths`: leave asset paths untouched (a WEB-form project on desktop, which
+  // is re-keyed into the vault separately; the desktop self-heal would break its paths).
+  const normalizeLoadedProject = (raw: any, opts?: { keepAssetPaths?: boolean }): Project => {
     const rawDefs = Array.isArray(raw?.dialogueFieldDefs) ? raw.dialogueFieldDefs : [];
     const dialogueFieldDefs: DialogueFieldDef[] =
       rawDefs.length > 0
@@ -2774,6 +2818,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       worldMapDocPins: Array.isArray(raw?.worldMapDocPins) ? raw.worldMapDocPins : [],
       worldMapLabelPins: Array.isArray(raw?.worldMapLabelPins) ? raw.worldMapLabelPins : [],
       worldMaps: Array.isArray(raw?.worldMaps) ? raw.worldMaps : [],
+      ...(raw?.desktopSync?.at ? { desktopSync: { at: String(raw.desktopSync.at) } } : {}),
     };
 
     // Ensure the currently-open map is represented in the worldMaps archive (migrates
@@ -2850,7 +2895,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     // Desktop only: self-heal asset paths whose collection-slug prefix has drifted
     // (e.g. a collection was moved into a folder). The canonical desktop path is
     // `<collectionSlug>/<entityId>/<filename>`, matching where the vault keeps files.
-    if (isDesktop) {
+    if (isDesktop && !opts?.keepAssetPaths) {
       p.collections = p.collections.map((c: any) => {
         const colSlug = colVaultSegments(c.folderPath, c.name).join("/");
         return {
@@ -2892,7 +2937,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       if (r?.kind === "column" && r.collectionId && r.entityId && r.fieldId) {
         return { kind: "column", collectionId: String(r.collectionId), entityId: String(r.entityId), fieldId: String(r.fieldId), value: r.value ?? "" };
       }
-      return { kind: "text", value: r?.kind === "text" ? String(r.value ?? "") : fallbackText };
+      if (r?.kind === "text") {
+        return {
+          kind: "text",
+          value: String(r.value ?? ""),
+          ...(typeof r.richValue === "string" && r.richValue ? { richValue: r.richValue } : {}),
+          ...(Array.isArray(r.links) && r.links.length ? { links: r.links } : {}),
+        };
+      }
+      return { kind: "text", value: fallbackText };
     };
 
     const coerceEntry = (e: any, defs: DialogueFieldDef[]): DatasetEntry => ({
@@ -3309,7 +3362,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     syncedProject: Project | null | undefined,
     vault?: string,
     assetPaths?: string[],
-    serverUpdatedAt?: string | null
+    serverUpdatedAt?: string | null,
+    webProject?: Project | null
   ) => {
     // Prefer the authoritative updated_at returned by the write; only fetch if absent.
     let ts = serverUpdatedAt ?? "";
@@ -3323,6 +3377,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const syncedHash = syncedProject ? hashString(syncContentString(syncedProject)) : undefined;
     const meta = { webProjectId, accountId, lastSyncedAt: ts, syncedHash, syncedAssetPaths: assetPaths };
     await setVaultSyncMeta(meta, vault);
+    // Baseline for the next item-by-item merge: this project in both forms.
+    if (syncedProject && webProject) {
+      await setVaultSyncBase({ local: syncedProject, web: webProject }, vault).catch(console.warn);
+    }
     setSyncMeta(meta);
     setWebHasNewer(false);
     return meta;
@@ -3378,8 +3436,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     try {
       const result = await webPlatform.loadProject(uid, projectId);
       if (!result) throw new Error("Project not found on your web account.");
-      const proj = normalizeLoadedProject(result.project);
+      const proj = normalizeLoadedProject(result.project, { keepAssetPaths: true });
       proj.name = result.project.name ?? proj.name;
+      const webForm = structuredClone(proj);
 
       const vault = (await renameVaultFolder(proj.name)) ?? picked;
 
@@ -3392,7 +3451,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       }
       await rekeyAndUploadAssets(proj, bytes);
       await platform.saveProject(vault, proj);
-      await stampSynced(projectId, uid, proj, vault, webAssetPathsFor(proj, uid));
+      await stampSynced(projectId, uid, proj, vault, webAssetPathsFor(proj, uid), null, webForm);
 
       setProjectRowId(vault);
       updateRecentVaultName(vault, proj.name);
@@ -3425,7 +3484,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       const vault = (await renameVaultFolder(norm.name)) ?? picked;
       await platform.saveProject(vault, norm);
       const created = await webPlatform.createProject(uid, norm);
-      await stampSynced(created.rowId, uid, norm, vault, webAssetPathsFor(norm, uid));
+      await stampSynced(created.rowId, uid, norm, vault, webAssetPathsFor(norm, uid), null, structuredClone(norm));
 
       setProjectRowId(vault);
       updateRecentVaultName(vault, seed.name);
@@ -3504,7 +3563,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     };
     for (const m of proj.worldMaps ?? []) m.imagePath = remap(m.imagePath);
     if (proj.view) proj.view.worldMapImagePath = remap(proj.view.worldMapImagePath);
-    return { uploads, allWebPaths: [...allWebPaths] };
+    return { uploads, allWebPaths: [...allWebPaths], pathMap };
   };
 
   // Every web asset path for a project (no upload) — used to record the synced asset
@@ -3521,15 +3580,17 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const syncPushToWeb = async (
     webProjectId: string,
     accountId: string,
-    opts?: { incremental?: boolean; force?: boolean }
-  ): Promise<{ project: Project; assetPaths: string[]; updatedAt: string | null }> => {
-    const live = (projectRef.current ?? project) as Project;
+    opts?: { incremental?: boolean; force?: boolean; project?: Project; expectedUpdatedAt?: string | null }
+  ): Promise<{ project: Project; webProject: Project; assetPaths: string[]; updatedAt: string | null }> => {
+    const live = (opts?.project ?? projectRef.current ?? project) as Project;
     const clone = structuredClone(live) as Project;
+    // Lets the web app show "also on desktop, last synced …". Web copy only.
+    clone.desktopSync = { at: new Date().toISOString() };
     const meta = await getVaultSyncMeta(getVaultPath() ?? undefined);
 
-    // Safe pushes use optimistic concurrency against our last-synced timestamp; forced
-    // pushes (explicit "Sync now → Push") overwrite unconditionally.
-    const expected = opts?.force ? null : meta?.lastSyncedAt ?? null;
+    // Safe pushes use optimistic concurrency against our last-synced timestamp (or the
+    // web timestamp a merge was based on); forced pushes ("Sync now → Push") overwrite.
+    const expected = opts?.force ? null : opts?.expectedUpdatedAt ?? meta?.lastSyncedAt ?? null;
 
     // Manual/forced pushes re-upload everything (authoritative); auto-sync only new assets.
     const already = opts?.incremental ? new Set(meta?.syncedAssetPaths ?? []) : new Set<string>();
@@ -3556,30 +3617,212 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     // Synced asset set = previously-synced (still present) + newly uploaded; never the
     // ones we couldn't read.
     const syncedAssets = allWebPaths.filter((p) => already.has(p) || uploadedNew.has(p));
-    return { project: live, assetPaths: syncedAssets, updatedAt: result.updatedAt };
+    return { project: live, webProject: clone, assetPaths: syncedAssets, updatedAt: result.updatedAt };
   };
 
-  // Pull the linked web project (+ assets) down, overwriting the local vault.
-  // Returns the project that is now the synced baseline.
-  const syncPullFromWeb = async (webProjectId: string, accountId: string): Promise<Project> => {
-    const result = await webPlatform.loadProject(accountId, webProjectId);
-    if (!result) throw new Error("The linked web project no longer exists.");
-    const proj = normalizeLoadedProject(result.project);
-    proj.name = result.project.name ?? proj.name;
-    const bytes = new Map<string, Uint8Array>();
-    for (const p of collectAssetPaths(proj)) {
-      const b = await webPlatform.readAssetBytes(p).catch(() => null);
-      if (b) bytes.set(p, b);
+  // Web asset path → vault path for every asset whose bytes are already on this device
+  // (current project + last-synced baseline), so pulls/merges download only new files.
+  const knownLocalAssetPaths = (local: Project | null, base: { local: Project; web: Project } | null, accountId: string) => {
+    const known = new Map<string, string>();
+    const add = (webPath?: string, localPath?: string) => { if (webPath && localPath) known.set(webPath, localPath); };
+    if (base) {
+      const lCols = new Map(base.local.collections.map((c) => [c.id, c] as const));
+      for (const wc of base.web.collections ?? []) {
+        const lRows = new Map((lCols.get(wc.id)?.rows ?? []).map((r) => [r.id, r] as const));
+        for (const wr of wc.rows ?? []) {
+          const lAssets = lRows.get(wr.id)?.assets ?? [];
+          for (const wa of wr.assets ?? []) add(wa.path, lAssets.find((a) => a.id === wa.id)?.path);
+        }
+      }
+      const wCov = base.web.view?.timelineCovers ?? {};
+      const lCov = base.local.view?.timelineCovers ?? {};
+      for (const k of Object.keys(wCov)) add(wCov[Number(k)], lCov[Number(k)]);
+      const lMaps = new Map((base.local.worldMaps ?? []).map((m) => [m.id, m] as const));
+      for (const m of base.web.worldMaps ?? []) add(m.imagePath, lMaps.get(m.id)?.imagePath);
+      add(base.web.view?.worldMapImagePath, base.local.view?.worldMapImagePath);
     }
-    await rekeyAndUploadAssets(proj, bytes);
-    const vault = getVaultPath();
-    if (vault) await platform.saveProject(vault, proj);
+    if (local) {
+      for (const [localPath, webPath] of rekeyForWeb(structuredClone(local), accountId).pathMap) {
+        if (!known.has(webPath)) known.set(webPath, localPath);
+      }
+    }
+    return known;
+  };
+
+  // Convert a WEB-form project into vault form: re-key every asset path, downloading
+  // only files not already on this device. Never overwrites a different local file
+  // that happens to share a name. Returns a new project; `webProj` is untouched.
+  const localizeWebProject = async (webProj: Project, known: Map<string, string>): Promise<Project> => {
+    const proj = structuredClone(webProj);
+    const done = new Map<string, string>();
+    const place = async (webPath: string | undefined, target: string, name: string, mime: string): Promise<string | undefined> => {
+      if (!webPath) return webPath;
+      const cached = done.get(webPath);
+      if (cached) return cached;
+      const knownPath = known.get(webPath);
+      if (knownPath && (await vaultAssetExists(knownPath))) {
+        done.set(webPath, knownPath);
+        return knownPath;
+      }
+      let dest = knownPath ?? target;
+      const bytes = await webPlatform.readAssetBytes(webPath).catch(() => null);
+      if (bytes) {
+        if (await vaultAssetExists(dest)) {
+          const cut = dest.lastIndexOf("/") + 1;
+          dest = `${dest.slice(0, cut)}${Date.now().toString(36)}_${dest.slice(cut)}`;
+        }
+        await platform.uploadAsset(new File([bytes as unknown as BlobPart], name, { type: mime }), dest);
+      }
+      done.set(webPath, dest);
+      return dest;
+    };
+
+    for (const col of proj.collections ?? []) {
+      const colSlug = colVaultSegments(col.folderPath, col.name).join("/");
+      for (const row of col.rows ?? []) {
+        const entityKey = String(row.values?.["id"] ?? "") || row.id;
+        for (const a of row.assets ?? []) {
+          if (!a?.path) continue;
+          const safeName = sanitizeSegment(a.name) || "file";
+          a.path = (await place(a.path, `${colSlug}/${entityKey}/${safeName}`, a.name, a.mime || "application/octet-stream")) ?? a.path;
+        }
+      }
+    }
+    const covers = proj.view?.timelineCovers;
+    if (covers) {
+      for (const k of Object.keys(covers)) {
+        const beat = Number(k);
+        const webPath = covers[beat];
+        if (!webPath) continue;
+        const base = sanitizeSegment(webPath.split("/").pop() || `cover_${beat}`) || `cover_${beat}`;
+        covers[beat] = (await place(webPath, `timeline/${beat}/${base}`, base, guessImageMime(base))) ?? webPath;
+      }
+    }
+    const mapImage = async (webPath?: string) => {
+      if (!webPath) return webPath;
+      const base = sanitizeSegment(webPath.split("/").pop() || "map") || "map";
+      return place(webPath, `worldmaps/${base}`, base, guessImageMime(base));
+    };
+    for (const m of proj.worldMaps ?? []) m.imagePath = await mapImage(m.imagePath);
+    if (proj.view) proj.view.worldMapImagePath = await mapImage(proj.view.worldMapImagePath);
+    return proj;
+  };
+
+  // True when this device has content that isn't on the web yet (or no record of it).
+  const hasUnsyncedLocal = (local: Project | null, meta: { syncedHash?: string } | null) =>
+    !!local && (!meta?.syncedHash || hashString(syncContentString(local)) !== meta.syncedHash);
+
+  // Show a freshly synced/merged project, keeping the open document/table if they survived.
+  const adoptSyncedProject = (proj: Project) => {
     setProject(proj);
-    setActiveDocId(proj.documents[0]?.id ?? "");
-    setActiveCollectionId(proj.collections[0]?.id ?? "");
+    setActiveDocId((cur) => (proj.documents.some((d) => d.id === cur) ? cur : proj.documents[0]?.id ?? ""));
+    setActiveCollectionId((cur) => (proj.collections.some((c) => c.id === cur) ? cur : proj.collections[0]?.id ?? ""));
     lastSavedJsonRef.current = JSON.stringify(proj);
     setIsDirty(false);
-    return proj;
+  };
+
+  // Load the linked web project in both forms: as stored on the web, and localized
+  // into the vault (only new assets downloaded).
+  const fetchWebProject = async (webProjectId: string, accountId: string) => {
+    const result = await webPlatform.loadProject(accountId, webProjectId);
+    if (!result) throw new Error("The linked web project no longer exists.");
+    const webProject = normalizeLoadedProject(result.project, { keepAssetPaths: true });
+    webProject.name = result.project.name ?? webProject.name;
+    const base = await getVaultSyncBase();
+    const localized = await localizeWebProject(webProject, knownLocalAssetPaths(projectRef.current, base, accountId));
+    return { webProject, localized: normalizeLoadedProject(localized), base };
+  };
+
+  // Pull the linked web project down, overwriting the local vault. Any local work that
+  // isn't on the web yet is backed up first. Returns the new baseline (both forms).
+  const syncPullFromWeb = async (webProjectId: string, accountId: string): Promise<{ project: Project; webProject: Project }> => {
+    const local = projectRef.current;
+    if (local && hasUnsyncedLocal(local, await getVaultSyncMeta())) await writeVaultBackup(local, "before-pull");
+    const { webProject, localized } = await fetchWebProject(webProjectId, accountId);
+    const vault = getVaultPath();
+    if (vault) await platform.saveProject(vault, localized);
+    adoptSyncedProject(localized);
+    return { project: localized, webProject };
+  };
+
+  // Merge: combine this device's changes with the web's item by item (syncMerge.ts),
+  // then push the result. Nothing is dropped: items edited on both sides are kept
+  // twice. Local work is backed up first. Throws WEB_CONFLICT if the web changed
+  // mid-merge (the merged result stays local, so the next attempt just merges again).
+  const syncMergeWithWeb = async (webProjectId: string, accountId: string): Promise<MergeConflict[]> => {
+    if (dirtyRef.current) await saveProjectToSupabase();
+    const local = projectRef.current;
+    if (!local) throw new Error("No project loaded.");
+
+    // Read the web timestamp BEFORE the data: if the web changes after this, our push
+    // is refused (optimistic concurrency) instead of overwriting that change.
+    const { data: tsRow } = await supabase.from("projects").select("updated_at").eq("id", webProjectId).maybeSingle();
+    const webUpdatedAt = (tsRow?.updated_at as string | undefined) ?? null;
+
+    await writeVaultBackup(local, "before-merge");
+    const { webProject, localized, base } = await fetchWebProject(webProjectId, accountId);
+    const { merged: raw, conflicts } = mergeProjects({
+      baseLocal: base?.local ?? null,
+      baseWeb: base?.web ?? null,
+      local,
+      webRaw: webProject,
+      webLocal: localized,
+    });
+    const merged = normalizeLoadedProject(raw);
+
+    const vault = getVaultPath();
+    if (vault) await platform.saveProject(vault, merged);
+    adoptSyncedProject(merged);
+
+    const res = await syncPushToWeb(webProjectId, accountId, { incremental: true, project: merged, expectedUpdatedAt: webUpdatedAt });
+    await stampSynced(webProjectId, accountId, merged, undefined, res.assetPaths, res.updatedAt, res.webProject);
+    return conflicts;
+  };
+
+  const describeConflicts = (conflicts: MergeConflict[]) => {
+    const label = (c: MergeConflict) => (c.kind === "document" ? "Document" : c.kind === "record" ? "Record" : "Condition entry in");
+    const lines = conflicts.slice(0, 8).map((c) => `• ${label(c)} ${c.name}`);
+    if (conflicts.length > 8) lines.push(`• …and ${conflicts.length - 8} more`);
+    const count = conflicts.length === 1 ? "1 item was" : `${conflicts.length} items were`;
+    return `${count} edited both here and on the web, so both versions were kept (the web one is marked "(web copy)" or "_WEB"):\n\n${lines.join("\n")}\n\nReview them and delete the version you don't want.`;
+  };
+
+  // File → Restore a backup… (desktop): replace the project with a backup snapshot.
+  const restoreBackup = async () => {
+    setFileMenuOpen(false);
+    const backups = await listVaultBackups();
+    if (backups.length === 0) {
+      appModal.alert("There are no backups for this project yet. One is made automatically before a sync replaces or merges your work.", { title: "Restore a backup" });
+      return;
+    }
+    const reasonLabel: Record<string, string> = {
+      "before-pull": "before pulling from web",
+      "before-merge": "before merging with web",
+      "web-before-push": "web copy, before pushing over it",
+      "before-restore": "before restoring a backup",
+    };
+    const file = await appModal.select({
+      title: "Restore a backup",
+      message: "Choose a snapshot to restore. Your current project is backed up first, so this can be undone.",
+      options: backups.map((b) => ({ value: b.file, label: `${b.date.toLocaleString()} (${reasonLabel[b.reason] ?? b.reason})` })),
+      defaultValue: backups[0].file,
+      confirmText: "Restore",
+    });
+    if (!file) return;
+    try {
+      const restored = normalizeLoadedProject(await readVaultBackup(file));
+      const current = projectRef.current;
+      if (current) await writeVaultBackup(current, "before-restore");
+      // Keep this vault's identity; mark dirty so it saves (and syncs) as a normal edit.
+      restored.id = current?.id ?? restored.id;
+      setProject(restored);
+      setActiveDocId(restored.documents[0]?.id ?? "");
+      setActiveCollectionId(restored.collections[0]?.id ?? "");
+      setIsDirty(true);
+      await appModal.alert("Backup restored.", { title: "Restore a backup" });
+    } catch (e: any) {
+      appModal.alert(e?.message ?? "Couldn't read that backup.", { title: "Restore a backup" });
+    }
   };
 
   // "Sync now": always ask which direction to sync (the other side is overwritten).
@@ -3609,37 +3852,45 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         ? `last synced ${new Date(syncMeta.lastSyncedAt).toLocaleString()}`
         : "not synced yet";
 
-    const pullOpt = { value: "pull", label: "Pull: web → this device (overwrite local)" };
-    const pushOpt = { value: "push", label: "Push: this device → web (overwrite web)" };
+    // Merge is the safe default: it keeps changes from both sides. The overwrite
+    // options remain for when you really want one side to win outright.
     const choice = await appModal.select({
       title: t("dlg.syncProject"),
-      message: `Web copy last updated: ${webUpdated}\nThis device: ${localInfo}\n\nChoose a direction. The other side will be overwritten.`,
-      // When the web copy is newer, default to pulling it down.
-      options: webHasNewer ? [pullOpt, pushOpt] : [pushOpt, pullOpt],
-      defaultValue: webHasNewer ? "pull" : "push",
+      message: `Web copy last updated: ${webUpdated}\nThis device: ${localInfo}\n\nMerge keeps changes from both sides (anything edited on both is kept twice). The overwrite options replace the other side entirely; a backup is saved on this device first.`,
+      options: [
+        { value: "merge", label: "Merge: keep changes from both (recommended)" },
+        { value: "pull", label: "Pull: web → this device (overwrite local)" },
+        { value: "push", label: "Push: this device → web (overwrite web)" },
+      ],
+      defaultValue: "merge",
       confirmText: t("dlg.sync"),
     });
     if (!choice) return;
 
+    const { webProjectId, accountId } = syncMeta;
     setLoadingInit(true);
     try {
-      let syncedProj: Project;
-      let assetPaths: string[];
-      let serverTs: string | null = null;
-      if (choice === "push") {
+      if (choice === "merge") {
+        const conflicts = await syncMergeWithWeb(webProjectId, accountId);
+        await appModal.alert(conflicts.length ? describeConflicts(conflicts) : "Merged with your web account. Changes from both sides were kept.", { title: "Synced" });
+      } else if (choice === "push") {
         if (isDirty) await saveProjectToSupabase();
-        const res = await syncPushToWeb(syncMeta.webProjectId, syncMeta.accountId, { force: true });
-        syncedProj = res.project;
-        assetPaths = res.assetPaths;
-        serverTs = res.updatedAt;
+        // Keep the web copy we're about to replace (project data only; small download).
+        const current = await webPlatform.loadProject(accountId, webProjectId).catch(() => null);
+        if (current) await writeVaultBackup(normalizeLoadedProject(current.project, { keepAssetPaths: true }), "web-before-push");
+        const res = await syncPushToWeb(webProjectId, accountId, { force: true });
+        await stampSynced(webProjectId, accountId, res.project, undefined, res.assetPaths, res.updatedAt, res.webProject);
+        await appModal.alert("Pushed to your web account.", { title: "Synced" });
       } else {
-        syncedProj = await syncPullFromWeb(syncMeta.webProjectId, syncMeta.accountId);
-        assetPaths = webAssetPathsFor(syncedProj, syncMeta.accountId);
+        const { project: pulled, webProject } = await syncPullFromWeb(webProjectId, accountId);
+        await stampSynced(webProjectId, accountId, pulled, undefined, webAssetPathsFor(pulled, accountId), null, webProject);
+        await appModal.alert("Pulled from your web account.", { title: "Synced" });
       }
-      await stampSynced(syncMeta.webProjectId, syncMeta.accountId, syncedProj, undefined, assetPaths, serverTs);
-      await appModal.alert(choice === "push" ? "Pushed to your web account." : "Pulled from your web account.", { title: "Synced" });
     } catch (e: any) {
-      appModal.alert(e?.message ?? "Sync failed.", { title: "Sync" });
+      const msg = e?.message === WEB_CONFLICT
+        ? "The web copy changed while syncing, so nothing on the web was overwritten. Run Sync now again to merge the latest changes."
+        : e?.message ?? "Sync failed.";
+      appModal.alert(msg, { title: "Sync" });
     } finally {
       setLoadingInit(false);
     }
@@ -3668,6 +3919,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       const created = await webPlatform.createProject(uid, structuredClone(live) as Project);
       const clone = structuredClone(live) as Project;
       clone.id = created.project.id ?? clone.id;
+      clone.desktopSync = { at: new Date().toISOString() };
       const { uploads, allWebPaths } = rekeyForWeb(clone, uid);
       for (const u of uploads) {
         const data = await platform.readAssetBytes(u.oldPath).catch(() => null);
@@ -3676,7 +3928,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         await webPlatform.uploadAsset(file, u.newPath);
       }
       await webPlatform.saveProject(created.rowId, clone);
-      await stampSynced(created.rowId, uid, live, undefined, allWebPaths);
+      await stampSynced(created.rowId, uid, live, undefined, allWebPaths, null, clone);
       await appModal.alert("This project is now synced to your web account.", { title: "Synced" });
     } catch (e: any) {
       appModal.alert(e?.message ?? "Failed to sync this project.", { title: "Sync" });
@@ -3710,7 +3962,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const s = autoSyncStateRef.current;
     if (!isDesktop || !s.enabled || !s.pro || !s.meta || s.offline) return;
     if (s.meta.accountId !== s.accountId) return; // signed into a different account
-    if (s.webNewer) return; // web is ahead — don't auto-overwrite; user resolves via Sync now
+    if (s.webNewer) { void doAutoPull(); return; } // web is ahead: pull or merge instead of pushing
     const live = projectRef.current;
     if (!live) return;
     const unpushed = !!s.meta.syncedHash && hashString(syncContentString(live)) !== s.meta.syncedHash;
@@ -3722,7 +3974,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     autoSyncingRef.current = true;
     try {
       const res = await syncPushToWeb(s.meta.webProjectId, s.meta.accountId, { incremental: true });
-      await stampSynced(s.meta.webProjectId, s.meta.accountId, res.project, undefined, res.assetPaths, res.updatedAt);
+      await stampSynced(s.meta.webProjectId, s.meta.accountId, res.project, undefined, res.assetPaths, res.updatedAt, res.webProject);
     } catch (e: any) {
       // WEB_CONFLICT: the web changed since our baseline — leave it for the user to
       // resolve (the chip already flips to "newer on web" / "both changed"). Any other
@@ -3742,23 +3994,31 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     }, AUTO_SYNC_DELAY_MS);
   };
 
-  // Auto-pull: when the web copy is newer AND we have nothing local to lose, bring it
-  // down automatically so devices converge. Never pulls with unsaved/unpushed local
-  // edits (that's a "Both changed" conflict the user resolves via Sync now).
+  // Web copy is newer. Nothing local to lose → pull it down. Local changes too → merge
+  // item by item (backed up first; anything edited on both sides is kept twice), but
+  // only when there's a recorded baseline. Without one (older links) a merge can't tell
+  // edits from deletions, so that case waits for "Sync now".
   const doAutoPull = async () => {
     const s = autoSyncStateRef.current;
     if (!isDesktop || !s.enabled || !s.pro || !s.meta || s.offline) return;
     if (s.meta.accountId !== s.accountId) return;
+    // Mid-edit/save: the post-save auto-sync calls back in here once things settle.
     if (dirtyRef.current || savingRef.current || autoSyncingRef.current) return;
-    const live = projectRef.current;
-    const unpushed = !!s.meta?.syncedHash && !!live && hashString(syncContentString(live)) !== s.meta.syncedHash;
-    if (unpushed) return; // both sides changed → leave for manual resolution
+    const { webProjectId, accountId } = s.meta;
+    const unpushed = hasUnsyncedLocal(projectRef.current, s.meta);
+    if (unpushed && !(await getVaultSyncBase())) return; // "Both changed" → Sync now
     autoSyncingRef.current = true;
     try {
-      const proj = await syncPullFromWeb(s.meta.webProjectId, s.meta.accountId);
-      await stampSynced(s.meta.webProjectId, s.meta.accountId, proj, undefined, webAssetPathsFor(proj, s.meta.accountId));
+      if (unpushed) {
+        const conflicts = await syncMergeWithWeb(webProjectId, accountId);
+        if (conflicts.length) void appModal.alert(describeConflicts(conflicts), { title: "Merged with web" });
+      } else {
+        const { project: pulled, webProject } = await syncPullFromWeb(webProjectId, accountId);
+        await stampSynced(webProjectId, accountId, pulled, undefined, webAssetPathsFor(pulled, accountId), null, webProject);
+      }
     } catch {
-      /* silent — chip stays "newer on web" for manual pull */
+      // Silent: the chip keeps showing the state; the next save/focus/Sync now retries.
+      checkWebNewer();
     } finally {
       autoSyncingRef.current = false;
     }
@@ -5969,6 +6229,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       // `text`-mode chips are untouched.
       let documents = prev.documents;
       let collectionsOut = collections;
+      let datasets = prev.datasets;
       if (fieldId === "name" || fieldId === "id") {
         const labelOf: LabelResolver = (cid, eid) => {
           const col = collectionsOut.find((c) => c.id === cid);
@@ -6003,9 +6264,30 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             }
           }),
         }));
+        // Condition text results can hold chips too.
+        datasets = prev.datasets.map((ds) => {
+          let changed = false;
+          const entries = ds.entries.map((e) => {
+            const r = e.result;
+            if (r.kind !== "text" || !richContentHasChips(r.richValue)) return e;
+            try {
+              const res = reconcileDocChips(
+                { id: e.id, content: r.value, richContent: r.richValue, entityLinks: r.links ?? [] } as any,
+                labelOf,
+                colorOf
+              );
+              if (!res) return e;
+              changed = true;
+              return { ...e, result: { ...r, value: res.content, richValue: res.richContent, links: res.entityLinks } };
+            } catch {
+              return e;
+            }
+          });
+          return changed ? { ...ds, entries } : ds;
+        });
       }
 
-      return { ...prev, collections: collectionsOut, documents };
+      return { ...prev, collections: collectionsOut, documents, datasets };
     });
 
     // Trigger immediate folder rename on desktop
@@ -8307,6 +8589,57 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         </div>
       )}
 
+      {/* Web: this project is also synced from the desktop app. Web can't see unsynced
+          desktop work (desktop may be offline), so explain that edits here merge safely. */}
+      {!isDesktop && project?.desktopSync?.at && !desktopNoticeDismissed[project.id] && (() => {
+        let dismissed = false;
+        try { dismissed = sessionStorage.getItem(`desktop_notice_${project.id}`) === "1"; } catch { /* ignore */ }
+        if (dismissed) return null;
+        const mins = Math.max(0, Math.round((Date.now() - new Date(project.desktopSync.at).getTime()) / 60000));
+        const ago = mins < 1 ? "just now" : mins < 60 ? `${mins} min ago` : mins < 60 * 24 ? `${Math.round(mins / 60)} h ago` : `${Math.round(mins / 1440)} days ago`;
+        const dismiss = () => {
+          try { sessionStorage.setItem(`desktop_notice_${project.id}`, "1"); } catch { /* ignore */ }
+          setDesktopNoticeDismissed((d) => ({ ...d, [project.id]: true }));
+        };
+        return (
+          <div
+            role="status"
+            style={{
+              position: "fixed",
+              bottom: 14,
+              right: 14,
+              zIndex: 300,
+              maxWidth: 340,
+              background: "var(--bg-elevated)",
+              color: "var(--text-2)",
+              border: "1px solid var(--border-3)",
+              borderRadius: 10,
+              fontSize: 12,
+              lineHeight: 1.45,
+              padding: "10px 12px",
+              boxShadow: "0 6px 18px var(--overlay-3)",
+              display: "flex",
+              gap: 10,
+              alignItems: "flex-start",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 700, color: "var(--text)", marginBottom: 2 }}>Also on your desktop app</div>
+              Last synced from desktop {ago}. If the desktop has changes that haven't synced yet, they'll be merged
+              with your edits here when it next syncs. Anything edited in both places is kept twice so you can choose.
+            </div>
+            <button
+              type="button"
+              onClick={dismiss}
+              title="Dismiss"
+              style={{ border: "none", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 14, padding: 0, lineHeight: 1 }}
+            >
+              ✕
+            </button>
+          </div>
+        );
+      })()}
+
       {/* Desktop sign-in modal (also reachable in-app via the profile menu / sync chip) */}
       {signInModalNode}
 
@@ -9078,7 +9411,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                             return nv;
                           });
                         }}
-                        title="Automatically push to your web account a few seconds after each save (Pro). Skipped when the web copy is newer, to avoid overwriting it."
+                        title="Automatically push to your web account a few seconds after each save (Pro). When the web copy is newer, changes from both sides are merged instead (backed up first)."
                         style={{
                           width: "100%",
                           marginTop: 6,
@@ -9111,6 +9444,26 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                         >
                           {autoSyncOnSave ? t("common.on") : t("common.off")}
                         </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={restoreBackup}
+                        title="Snapshots saved on this device before a sync replaced or merged your work."
+                        style={{
+                          width: "100%",
+                          marginTop: 6,
+                          borderRadius: 8,
+                          border: "1px solid var(--border-3)",
+                          backgroundColor: "transparent",
+                          color: "var(--text-2)",
+                          cursor: "pointer",
+                          padding: "8px 10px",
+                          fontSize: 13,
+                          textAlign: "left",
+                        }}
+                      >
+                        Restore a backup…
                       </button>
                       </>
                     ) : (
@@ -12428,49 +12781,28 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                             </tr>
                           </thead>
 
+                          <DndContext
+                            sensors={dndSensors}
+                            collisionDetection={closestCenter}
+                            accessibility={{ container: document.body }}
+                            onDragEnd={({ active, over }: DragEndEvent) => {
+                              if (!over || active.id === over.id) return;
+                              const target = activeCollection.rows.findIndex((row) => row.id === over.id);
+                              if (target >= 0) moveRowToIndex(activeCollection.id, String(active.id), target);
+                            }}
+                          >
+                          <SortableContext items={activeCollection.rows.map((row) => row.id)} strategy={verticalListSortingStrategy}>
                           <tbody>
-                            {activeCollection.rows.map((r, rowIndex) => (
-                              <tr
+                            {activeCollection.rows.map((r) => (
+                              <SortableTableRow
                                 key={r.id}
-                                data-rowkey={`${activeCollection.id}:${r.id}`}
+                                id={r.id}
+                                rowKey={`${activeCollection.id}:${r.id}`}
+                                selected={activeRowId === r.id}
                                 onClick={() => setActiveRowId(r.id)}
                                 onContextMenu={(e) => { e.preventDefault(); setActiveRowId(r.id); setRowCtxMenu({ collectionId: activeCollection.id, rowId: r.id, x: e.clientX, y: e.clientY }); }}
-                                onDragOver={(e) => {
-                                  if (!draggingRowId || draggingRowId === r.id) return;
-                                  e.preventDefault();
-                                  setDragOverRowId(r.id);
-                                }}
-                                onDrop={(e) => {
-                                  e.preventDefault();
-                                  e.stopPropagation();
-
-                                  if (!draggingRowId || draggingRowId === r.id) {
-                                    setDraggingRowId(null);
-                                    setDragOverRowId(null);
-                                    return;
-                                  }
-
-                                  moveRowToIndex(activeCollection.id, draggingRowId, rowIndex);
-                                  setDraggingRowId(null);
-                                  setDragOverRowId(null);
-                                }}
-                                onDragEnd={() => {
-                                  setDraggingRowId(null);
-                                  setDragOverRowId(null);
-                                }}
-                                style={{
-                                  background:
-                                    draggingRowId === r.id
-                                      ? "var(--bg-row-drag)"
-                                      : activeRowId === r.id
-                                        ? "var(--bg-row-sel)"
-                                        : undefined,
-                                  cursor: "pointer",
-                                  outline: dragOverRowId === r.id && draggingRowId !== r.id ? "1px solid var(--accent)" : undefined,
-                                  outlineOffset: -1,
-                                  opacity: draggingRowId === r.id ? 0.6 : 1,
-                                }}
                               >
+                                {(dragHandle) => (<>
                                 <td
                                   style={{
                                     padding: "6px 4px 6px 10px",
@@ -12482,19 +12814,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                 >
                                   <button
                                     type="button"
-                                    draggable
+                                    ref={dragHandle.ref}
+                                    {...dragHandle.props}
                                     onClick={(e) => e.stopPropagation()}
-                                    onDragStart={(e) => {
-                                      e.stopPropagation();
-                                      setDraggingRowId(r.id);
-                                      setDragOverRowId(r.id);
-                                      e.dataTransfer.effectAllowed = "move";
-                                      e.dataTransfer.setData("text/plain", r.id);
-                                    }}
-                                    onDragEnd={() => {
-                                      setDraggingRowId(null);
-                                      setDragOverRowId(null);
-                                    }}
                                     title="Drag to reorder row"
                                     style={{
                                       width: 24,
@@ -12502,11 +12824,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                       border: "none",
                                       background: "transparent",
                                       color: "var(--text-dim)",
-                                      cursor: "grab",
+                                      cursor: dragHandle.isDragging ? "grabbing" : "grab",
+                                      touchAction: "none",
                                       padding: 0,
                                       fontSize: 14,
                                       lineHeight: 1,
-                                      opacity: draggingRowId === r.id ? 0.9 : 0.35,
+                                      opacity: dragHandle.isDragging ? 0.9 : 0.35,
                                     }}
                                   >
                                     ⋮⋮
@@ -12911,9 +13234,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                     </div>
                                   </td>
                                 ) : null}
-                              </tr>
+                                </>)}
+                              </SortableTableRow>
                             ))}
                           </tbody>
+                          </SortableContext>
+                          </DndContext>
                         </table>
                       </div>
                     </div>

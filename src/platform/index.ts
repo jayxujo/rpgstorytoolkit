@@ -16,7 +16,14 @@ import {
   openRecentVault,
   getVaultSyncMeta,
   setVaultSyncMeta,
+  getVaultSyncBase,
+  setVaultSyncBase,
+  writeVaultBackup,
+  listVaultBackups,
+  readVaultBackup,
+  vaultAssetExists,
   type RecentVault,
+  type VaultBackup,
 } from './desktop';
 
 const isDesktop = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -39,6 +46,12 @@ export {
   openRecentVault,
   getVaultSyncMeta,
   setVaultSyncMeta,
+  getVaultSyncBase,
+  setVaultSyncBase,
+  writeVaultBackup,
+  listVaultBackups,
+  readVaultBackup,
+  vaultAssetExists,
 };
-export type { RecentVault };
+export type { RecentVault, VaultBackup };
 export type { Platform, PlatformUser, PlatformProfile, LoadedProject } from './types';
