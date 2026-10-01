@@ -86,6 +86,7 @@ import {
   DIALOGUE_DATASET_ID,
 } from "./dialogueExport";
 import DatasetView from "./DatasetView";
+import LinkedTextField, { LinkedTextPreview, type LinkableRecord, type LinkedTextChange } from "./editor/LinkedTextField";
 import type { LinkEditorApi } from "./StoryEditor";
 import {
   migrateDocToChips,
@@ -159,6 +160,8 @@ const archiveActiveWorldMap = (p: Project): { worldMaps: WorldMapEntry[]; active
 
 // Free (non-Pro) plan: number of documents allowed before Pro/account is required.
 const FREE_DOC_LIMIT = 3;
+// Table cells show a truncated description preview; the full text is edited in the record page.
+const DESCRIPTION_PREVIEW_CHARS = 70;
 
 // Free (non-Pro) plan: number of uploaded images allowed PER PROJECT on the web
 // (across record assets, world-map images, and timeline covers) before Pro is
@@ -1007,6 +1010,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
 
   // ✅ Fix: keep focus in collection cell inputs while typing (prevents the editor from stealing focus on rerenders)
+  // The one String cell currently mounted as a LinkedTextField (`${collectionId}:${rowId}:${fieldId}`).
+  const [editingLinkedCell, setEditingLinkedCell] = useState<string | null>(null);
   const pendingCellFocusRestoreRef = useRef<{
     key: string;
     selectionStart: number | null;
@@ -1884,6 +1889,12 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
     return out;
   }, [project, getRowLabel]);
+
+  // Same records, in the shape LinkedTextField ("/" links in String cells) expects.
+  const linkableRecords = useMemo<LinkableRecord[]>(
+    () => slashItems.map(({ collectionColor, ...r }) => ({ ...r, color: collectionColor })),
+    [slashItems]
+  );
 
   // ✅ Timeline label click → open entity in right panel (collection + highlight + scroll)
   const openEntityInCollection = useCallback(
@@ -6204,6 +6215,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             rows: c.rows.map((r) => {
               if (r.id !== rowId) return r;
               const updated = { ...r, values: { ...r.values, [fieldId]: nextValue } };
+              // A plain write replaces any linked (rich) version of this cell.
+              if (updated.cellLinks?.[fieldId]) {
+                const { [fieldId]: _drop, ...rest } = updated.cellLinks;
+                updated.cellLinks = Object.keys(rest).length ? rest : undefined;
+              }
               // Update stored asset paths if entity key changed
               if (
                 fieldId === "id" && isDesktop &&
@@ -6264,6 +6280,29 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             }
           }),
         }));
+        // Linked String cells too.
+        collectionsOut = collectionsOut.map((c) => ({
+          ...c,
+          rows: c.rows.map((r) => {
+            if (!r.cellLinks) return r;
+            let cellLinks = r.cellLinks;
+            let values = r.values;
+            for (const [fid, cell] of Object.entries(r.cellLinks)) {
+              if (!richContentHasChips(cell.richValue)) continue;
+              try {
+                const res = reconcileDocChips(
+                  { id: `${r.id}:${fid}`, content: String(values[fid] ?? ""), richContent: cell.richValue, entityLinks: cell.links } as any,
+                  labelOf,
+                  colorOf
+                );
+                if (!res) continue;
+                cellLinks = { ...cellLinks, [fid]: { richValue: res.richContent, links: res.entityLinks } };
+                values = { ...values, [fid]: res.content };
+              } catch { /* leave the cell as is */ }
+            }
+            return cellLinks === r.cellLinks ? r : { ...r, cellLinks, values };
+          }),
+        }));
         // Condition text results can hold chips too.
         datasets = prev.datasets.map((ds) => {
           let changed = false;
@@ -6297,6 +6336,60 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     ) {
       platform.renameEntityFolder(entityColSegments, oldEntityKey, newEntityKey).catch(console.warn);
     }
+  };
+
+  // String cell edited through LinkedTextField: keeps the plain text in `values` and the
+  // rich state + chips in `cellLinks` (dropped once the cell no longer links anything).
+  const updateLinkedCell = (collectionId: Id, rowId: Id, fieldId: Id, next: LinkedTextChange) => {
+    setProject((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        collections: prev.collections.map((c) =>
+          c.id !== collectionId
+            ? c
+            : {
+              ...c,
+              rows: c.rows.map((r) => {
+                if (r.id !== rowId) return r;
+                const { [fieldId]: _old, ...rest } = r.cellLinks ?? {};
+                const cellLinks = next.links.length ? { ...rest, [fieldId]: { richValue: next.richValue, links: next.links } } : rest;
+                return { ...r, values: { ...r.values, [fieldId]: next.value }, cellLinks: Object.keys(cellLinks).length ? cellLinks : undefined };
+              }),
+            }
+        ),
+      };
+    });
+  };
+
+  // Linked String cells render as a light preview; only the clicked/focused one mounts
+  // the Lexical editor (one editor per cell would be heavy in big tables).
+  const renderLinkedCell = (collectionId: Id, row: CollectionRow, fieldId: Id, style: React.CSSProperties) => {
+    const key = `${collectionId}:${row.id}:${fieldId}`;
+    if (editingLinkedCell !== key) {
+      return (
+        <LinkedTextPreview
+          value={String(row.values[fieldId] ?? "")}
+          links={row.cellLinks?.[fieldId]?.links}
+          records={linkableRecords}
+          style={style}
+          onActivate={() => setEditingLinkedCell(key)}
+        />
+      );
+    }
+    return (
+      <LinkedTextField
+        fieldKey={`${row.id}:${fieldId}`}
+        value={String(row.values[fieldId] ?? "")}
+        richValue={row.cellLinks?.[fieldId]?.richValue}
+        records={linkableRecords}
+        onChange={(next) => updateLinkedCell(collectionId, row.id, fieldId, next)}
+        compact
+        autoFocus
+        onBlur={() => setEditingLinkedCell((k) => (k === key ? null : k))}
+        style={style}
+      />
+    );
   };
 
   const addFieldToActiveCollection = async () => {
@@ -12449,6 +12542,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                           <textarea value={String(raw ?? "")} rows={2}
                                             onChange={(e) => updateCollectionCell(cid, rid, f.id, e.target.value)}
                                             style={{ width: "100%", borderRadius: 6, border: "1px solid var(--border-2)", background: "var(--bg-panel)", color: "var(--text)", padding: "6px 8px", fontSize: 13, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box" }} />
+                                        ) : f.type === "string" && f.id !== "id" ? (
+                                          renderLinkedCell(cid, recordPageRow!, f.id, { width: "100%", borderRadius: 6, border: "1px solid var(--border-2)", background: "var(--bg-panel)", color: "var(--text)", padding: "2px 2px", fontSize: 13, boxSizing: "border-box" })
                                         ) : (
                                           <input type={f.type === "number" ? "number" : "text"} value={String(raw ?? "")}
                                             onChange={(e) => updateCollectionCell(cid, rid, f.id, e.target.value)}
@@ -12894,7 +12989,11 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                         title={t("rec.editAsPage")}
                                         style={{ fontSize: 13, color: "var(--text-2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: "pointer", opacity: String(r.values["description"] ?? "").trim() ? 0.95 : 0.45 }}
                                       >
-                                        {String(r.values["description"] ?? "").replace(/\s+/g, " ").trim() || t("rec.editAsPageDots")}
+                                        {(() => {
+                                          const desc = String(r.values["description"] ?? "").replace(/\s+/g, " ").trim();
+                                          if (!desc) return t("rec.editAsPageDots");
+                                          return desc.length > DESCRIPTION_PREVIEW_CHARS ? `${desc.slice(0, DESCRIPTION_PREVIEW_CHARS).trimEnd()}...` : desc;
+                                        })()}
                                       </div>
                                     ) : f.id === "id" ? (
                                       (() => {
@@ -13133,6 +13232,18 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
                                             fontFamily: "inherit",
                                           }}
                                         />
+                                      ) : f.type === "string" && f.id !== "name" ? (
+                                        renderLinkedCell(activeCollection.id, r, f.id, {
+                                          width: "100%",
+                                          minWidth: 160,
+                                          borderRadius: 6,
+                                          border: "1px solid var(--border-2)",
+                                          background: "var(--bg-surface)",
+                                          color: "var(--text)",
+                                          padding: "2px 2px",
+                                          fontSize: 13,
+                                          boxSizing: "border-box",
+                                        })
                                       ) : (
                                         <input
                                           data-cellkey={`${activeCollection.id}:${r.id}:${f.id}`}

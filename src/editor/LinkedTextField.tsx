@@ -51,6 +51,10 @@ type Props = {
   onChange: (next: LinkedTextChange) => void;
   placeholder?: string;
   style?: React.CSSProperties;
+  // Table-cell look: one line that scrolls instead of wrapping, no link button ("/" still links).
+  compact?: boolean;
+  autoFocus?: boolean; // focus on mount, caret at the end
+  onBlur?: () => void;
 };
 
 const MAX_ITEMS = 8;
@@ -173,7 +177,7 @@ const ControllerPlugin: React.FC<{
   return null;
 };
 
-const LinkedTextField: React.FC<Props> = ({ fieldKey, value, richValue, records, onChange, placeholder, style }) => {
+const LinkedTextField: React.FC<Props> = ({ fieldKey, value, richValue, records, onChange, placeholder, style, compact, autoFocus, onBlur }) => {
   const wrapRef = React.useRef<HTMLDivElement | null>(null);
   const editorRef = React.useRef<LexicalEditor | null>(null);
   const lastEmittedRef = React.useRef<string>(richValue ?? "");
@@ -218,7 +222,11 @@ const LinkedTextField: React.FC<Props> = ({ fieldKey, value, richValue, records,
     });
     setActive(0);
   }, []);
-  const onEditor = React.useCallback((e: LexicalEditor) => { editorRef.current = e; }, []);
+  const onEditor = React.useCallback((e: LexicalEditor) => {
+    editorRef.current = e;
+    if (autoFocus) e.focus(undefined, { defaultSelection: "rootEnd" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const insertChip = (rec: LinkableRecord) => {
     const editor = editorRef.current;
@@ -375,14 +383,18 @@ const LinkedTextField: React.FC<Props> = ({ fieldKey, value, richValue, records,
             contentEditable={
               <ContentEditable
                 aria-label={placeholder}
-                onBlur={() => setTimeout(() => setMenu((m) => (m?.mode === "slash" ? null : m)), 150)}
+                onBlur={() => {
+                  setTimeout(() => setMenu((m) => (m?.mode === "slash" ? null : m)), 150);
+                  onBlur?.();
+                }}
                 style={{
                   outline: "none",
                   minHeight: 18,
                   lineHeight: "18px",
-                  padding: "4px 30px 4px 6px",
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
+                  padding: compact ? "4px 6px" : "4px 30px 4px 6px",
+                  ...(compact
+                    ? { whiteSpace: "pre", overflowX: "auto", scrollbarWidth: "none" }
+                    : { whiteSpace: "pre-wrap", wordBreak: "break-word" }),
                 }}
               />
             }
@@ -399,7 +411,7 @@ const LinkedTextField: React.FC<Props> = ({ fieldKey, value, richValue, records,
         <SyncPlugin fieldKey={fieldKey} value={value} richValue={richValue} lastEmittedRef={lastEmittedRef} />
         <ControllerPlugin onEditor={onEditor} onSlash={onSlash} menuOpen={!!menu && items.length > 0} onMenuKey={onMenuKey} />
       </LexicalComposer>
-      <button
+      {!compact && <button
         type="button"
         onMouseDown={(e) => e.preventDefault()}
         onClick={openLinkMenu}
@@ -407,8 +419,48 @@ const LinkedTextField: React.FC<Props> = ({ fieldKey, value, richValue, records,
         style={{ position: "absolute", right: 3, top: "50%", transform: "translateY(-50%)", width: 22, height: 20, border: "none", borderRadius: 4, background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 12, padding: 0 }}
       >
         🔗
-      </button>
+      </button>}
       {menuNode}
+    </div>
+  );
+};
+
+// Read-only look of a LinkedTextField (plain text with chips), shown in table cells until
+// clicked so big tables don't mount one editor per cell. Same box metrics as `compact`.
+export const LinkedTextPreview: React.FC<{
+  value: string;
+  links?: EntityLink[];
+  records: LinkableRecord[];
+  style?: React.CSSProperties;
+  onActivate: () => void;
+}> = ({ value, links, records, style, onActivate }) => {
+  const parts: React.ReactNode[] = [];
+  let pos = 0;
+  [...(links ?? [])]
+    .filter((l) => l.end > l.start && l.start >= pos)
+    .sort((a, b) => a.start - b.start)
+    .forEach((l) => {
+      if (l.start < pos) return;
+      if (l.start > pos) parts.push(value.slice(pos, l.start));
+      const c = records.find((r) => r.collectionId === l.collectionId)?.color || "#4f8cff";
+      parts.push(
+        <span key={l.id} style={{ borderRadius: 4, padding: "0 1px", backgroundColor: c + "26", boxShadow: `inset 0 -1.5px 0 ${c}` }}>
+          {value.slice(l.start, l.end)}
+        </span>
+      );
+      pos = l.end;
+    });
+  if (pos < value.length) parts.push(value.slice(pos));
+  return (
+    <div
+      tabIndex={0}
+      onClick={onActivate}
+      onFocus={onActivate}
+      style={{ display: "flex", alignItems: "center", cursor: "text", ...style }}
+    >
+      <div style={{ flex: 1, minWidth: 0, minHeight: 18, lineHeight: "18px", padding: "4px 6px", whiteSpace: "pre", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {parts}
+      </div>
     </div>
   );
 };

@@ -4,7 +4,7 @@ import type { Platform, PlatformUser, PlatformProfile, LoadedProject } from './t
 import type { Project, Collection } from '../types';
 import { toSlug, docVaultSegments, colVaultSegments } from './slugify';
 import { richContentToMarkdown, type ResolvedLink } from './docMarkdown';
-import { buildDatasetFile } from '../dialogueExport';
+import { buildDatasetFile, serializeTextLinks } from '../dialogueExport';
 import { createSeedProject, DEFAULT_PROJECT_NAME } from './seedProject';
 import { getExperience } from '../persona';
 import type { EntityLink } from '../types';
@@ -495,12 +495,23 @@ function buildDocumentMarkdown(project: Project, doc: Project['documents'][numbe
   return lines.join('\n');
 }
 
-function buildCollectionExport(collection: Collection): Record<string, unknown>[] {
+function buildCollectionExport(collection: Collection, collections: Collection[]): Record<string, unknown>[] {
   return collection.rows.map(row => {
     const obj: Record<string, unknown> = {};
+    // Record links in String cells, per column label: `{ text, start, end, collection, record }`.
+    const links: Record<string, unknown[]> = {};
     for (const field of collection.schema) {
       obj[field.label] = row.values[field.id] ?? '';
+      const cell = field.type === 'string' ? row.cellLinks?.[field.id] : undefined;
+      const cellLinks = cell ? serializeTextLinks(collections, String(row.values[field.id] ?? ''), cell.links) : [];
+      if (cellLinks.length) links[field.label] = cellLinks;
     }
+    // Only when a cell links a record, so plain rows keep their shape.
+    if (Object.keys(links).length) obj._links = links;
+    // The record's icon (the asset picked as its cover), as a path under assets/, so a game can use
+    // the same image. Underscored so it can't collide with a column label.
+    const icon = row.assets?.find(a => a.id === row.profileAssetId);
+    if (icon) obj._icon = icon.path;
     return obj;
   });
 }
@@ -601,7 +612,7 @@ async function writeGameFiles(vault: string, project: Project): Promise<void> {
     }
     await fsWrite(
       joinPath(vault, "tables", `${parts.join('/')}.json`),
-      JSON.stringify(buildCollectionExport(collection), null, 2),
+      JSON.stringify(buildCollectionExport(collection, project.collections), null, 2),
     );
   }
 

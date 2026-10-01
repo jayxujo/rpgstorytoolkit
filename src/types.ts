@@ -39,6 +39,10 @@ export interface CollectionRow {
   // mirror (table preview / export / wiki fallback).
   descriptionRich?: string;            // Lexical JSON
   descriptionLinks?: EntityLink[];     // entity-link chips within the description
+
+  // Record links inside String cells, keyed by field id. `values[fieldId]` stays the
+  // plain-text mirror; this holds the Lexical JSON + chips (only for cells with links).
+  cellLinks?: Record<string, { richValue: string; links: EntityLink[] }>;
 }
 
 export interface Collection {
