@@ -14,6 +14,21 @@ export function datasetSubjectKey(project: Project, entry: DatasetEntry | any): 
 // Back-compat alias.
 export const dialogueCharKey = datasetSubjectKey;
 
+// What a condition field's value is called in the exported file and the sidebar tree: a record field's
+// value is stored as the record's internal row id and shown / exported as the record's ID.
+export function fieldLevelValue(
+  collections: Collection[],
+  def: { type: string; collectionId?: string },
+  raw: string | number | undefined,
+): string {
+  if (def.type === "record") {
+    const col = collections.find((c) => c.id === def.collectionId);
+    const row = col?.rows.find((r) => r.id === raw);
+    return row ? String(row.values["id"] || row.id) : String(raw ?? "");
+  }
+  return String(raw ?? "");
+}
+
 // Coerce a stored value (always string|number internally) to a typed JSON value.
 function coerceTyped(type: DatasetFieldType, value: string | number): string | number | boolean {
   if (type === "bool") return value === "true" || value === 1;
@@ -85,7 +100,7 @@ export function buildDatasetFile(project: Project, dataset: Dataset): DatasetFil
   for (const entry of entries) {
     const levels: string[] = [];
     if (hasSubject) levels.push(datasetSubjectKey(project, entry));
-    for (const def of fieldDefs) levels.push(String(entry.fields?.[def.id] ?? ""));
+    for (const def of fieldDefs) levels.push(fieldLevelValue(project.collections, def, entry.fields?.[def.id]));
 
     const serialized = serializeResult(project, entry.result);
 

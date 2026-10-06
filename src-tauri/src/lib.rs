@@ -167,6 +167,36 @@ fn list_dir(path: String) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+// Every file under `path`, at any depth, as [path relative to `path` (with "/"), size in bytes].
+// Hidden entries (".DS_Store", ".git"...) are skipped. Missing folder → empty list.
+#[tauri::command]
+fn list_files_recursive(path: String) -> Result<Vec<(String, u64)>, String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<(), String> {
+        for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let p = entry.path();
+            let meta = entry.metadata().map_err(|e| e.to_string())?;
+            if meta.is_dir() {
+                walk(root, &p, out)?;
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                out.push((rel, meta.len()));
+            }
+        }
+        Ok(())
+    }
+    let root = Path::new(&path);
+    let mut out = Vec::new();
+    if root.is_dir() {
+        walk(root, root, &mut out)?;
+    }
+    Ok(out)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -185,6 +215,7 @@ pub fn run() {
             trash_path,
             prune_empty_dirs,
             list_dir,
+            list_files_recursive,
             open_url
         ])
         .setup(|app| {

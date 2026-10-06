@@ -100,7 +100,10 @@ export type DatasetFieldType = "number" | "string" | "bool";
 export interface DatasetFieldDef {
   id: Id; // stable key used in saved entry.fields
   label: string; // user-facing label (e.g. "Stage", "Scene", "Chapter")
-  type: DatasetFieldType;
+  // A plain value type, or "record": each entry picks a record of `collectionId` (stored by its
+  // internal row id, so renaming the record's ID can't break it; exported as the record's ID).
+  type: DatasetFieldType | "record";
+  collectionId?: Id;
   defaultValue?: number | string;
 }
 

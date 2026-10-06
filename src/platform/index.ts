@@ -22,6 +22,8 @@ import {
   listVaultBackups,
   readVaultBackup,
   vaultAssetExists,
+  listVaultAssetFiles,
+  reconcileVaultAssets,
   type RecentVault,
   type VaultBackup,
 } from './desktop';
@@ -52,6 +54,8 @@ export {
   listVaultBackups,
   readVaultBackup,
   vaultAssetExists,
+  listVaultAssetFiles,
+  reconcileVaultAssets,
 };
 export type { RecentVault, VaultBackup };
 export type { Platform, PlatformUser, PlatformProfile, LoadedProject } from './types';

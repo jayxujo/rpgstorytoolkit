@@ -60,6 +60,8 @@ import {
   listVaultBackups,
   readVaultBackup,
   vaultAssetExists,
+  listVaultAssetFiles,
+  reconcileVaultAssets,
   type RecentVault,
 } from "./platform";
 import { mergeProjects, DEVICE_VIEW_KEYS, type MergeConflict } from "./syncMerge";
@@ -83,6 +85,7 @@ import { richContentToMarkdown } from "./platform/docMarkdown";
 import {
   buildDatasetFile,
   datasetSubjectKey,
+  fieldLevelValue,
   DIALOGUE_DATASET_ID,
 } from "./dialogueExport";
 import DatasetView from "./DatasetView";
@@ -945,6 +948,9 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
   const [project, setProject] = useState<Project | null>(null);
   const [projectRowId, setProjectRowId] = useState<string | null>(null);
   const [loadingInit, setLoadingInit] = useState(true);
+  // A long import from the web account (Launcher → "Available from your web account"): shown full-screen
+  // with a progress bar instead of the launcher sitting there looking stuck.
+  const [importProgress, setImportProgress] = useState<{ title: string; step: string; done: number; total: number } | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
   const [needsVaultPicker, setNeedsVaultPicker] = useState(false);
   const [vaultPickerBusy, setVaultPickerBusy] = useState(false);
@@ -2262,7 +2268,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       for (const entry of ds.entries) {
         const levels: string[] = [];
         if (hasSubject) levels.push(datasetSubjectKey(project, entry));
-        for (const def of fieldDefs) levels.push(String(entry.fields?.[def.id] ?? ""));
+        for (const def of fieldDefs) levels.push(fieldLevelValue(project.collections, def, entry.fields?.[def.id]));
 
         if (levels.length === 0) {
           if (!Array.isArray(nested["_"])) nested["_"] = [];
@@ -2905,7 +2911,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
     // Desktop only: self-heal asset paths whose collection-slug prefix has drifted
     // (e.g. a collection was moved into a folder). The canonical desktop path is
-    // `<collectionSlug>/<entityId>/<filename>`, matching where the vault keeps files.
+    // `<collectionSlug>/<entityId>/<path inside the record's folder>` — whatever comes after the
+    // record's own folder (subfolders included: `MAIN/crouch_fire/crouch_fire1.png`) is kept, only
+    // the part before it is rebuilt. (Rebuilding it as just the file name used to drop subfolders,
+    // pointing every nested asset at a file that isn't there.)
     if (isDesktop && !opts?.keepAssetPaths) {
       p.collections = p.collections.map((c: any) => {
         const colSlug = colVaultSegments(c.folderPath, c.name).join("/");
@@ -2917,8 +2926,10 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
             return {
               ...r,
               assets: r.assets.map((a: any) => {
-                const filename = String(a?.path ?? "").split("/").pop() ?? "";
-                return { ...a, path: `${colSlug}/${entityKey}/${filename}` };
+                const parts = String(a?.path ?? "").split("/");
+                const at = parts.lastIndexOf(entityKey);
+                const inside = at >= 0 && at < parts.length - 1 ? parts.slice(at + 1).join("/") : parts.pop() ?? "";
+                return { ...a, path: `${colSlug}/${entityKey}/${inside}` };
               }),
             };
           }),
@@ -2934,7 +2945,8 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
         .map((d: any) => ({
           id: String(d?.id ?? "").trim(),
           label: String(d?.label ?? "Field").trim() || "Field",
-          type: (d?.type === "string" || d?.type === "bool" ? d.type : "number") as DatasetFieldType,
+          type: (d?.type === "string" || d?.type === "bool" || d?.type === "record" ? d.type : "number") as DatasetFieldType | "record",
+          ...(d?.type === "record" && d?.collectionId ? { collectionId: String(d.collectionId) } : {}),
           defaultValue: d?.defaultValue,
         }))
         .filter((d: DialogueFieldDef) => !!d.id);
@@ -3123,6 +3135,24 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     return p;
   };
 
+  // Desktop: match every record's asset list to what's actually in its vault folder — files added
+  // straight into the folder are attached, entries whose file moved within it are repointed (see
+  // reconcileVaultAssets). Runs on opening the vault, whenever the window comes back into focus (so
+  // files dropped in from Finder meanwhile show up), and after a sync. Changes autosave like any edit.
+  const reconcileAssetsFromDisk = async () => {
+    if (!isDesktop || !getVaultPath()) return;
+    const files = await listVaultAssetFiles();
+    if (!files.length) return;
+    setProject((cur) => (cur ? reconcileVaultAssets(cur, files) ?? cur : cur));
+  };
+
+  useEffect(() => {
+    if (!isDesktop || !projectRowId) return;
+    const onFocus = () => { void reconcileAssetsFromDisk(); };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [projectRowId]);
+
   const loadOrCreateProject = async (uid: string): Promise<Project | null> => {
     // On web, reopen whichever project the user last had open.
     const preferred = !isDesktop && uid ? (localStorage.getItem(`web_active_project_${uid}`) ?? undefined) : undefined;
@@ -3141,6 +3171,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
     setProject(normalized);
     setProjectRowId(rowId);
+    if (isDesktop) void reconcileAssetsFromDisk();
     if (!isDesktop && uid) {
       localStorage.setItem(`web_active_project_${uid}`, rowId);
       platform.listProjects(uid).then(setWebProjects).catch(() => {});
@@ -3443,6 +3474,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const picked = await createVaultFolder();
     if (!picked) return;
     setLoadingInit(true);
+    setImportProgress({ title: "Importing from your web account", step: "Fetching the project…", done: 0, total: 0 });
     await resizeForLauncher(false);
     try {
       const result = await webPlatform.loadProject(uid, projectId);
@@ -3450,17 +3482,25 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       const proj = normalizeLoadedProject(result.project, { keepAssetPaths: true });
       proj.name = result.project.name ?? proj.name;
       const webForm = structuredClone(proj);
+      const title = `Importing ${proj.name}`;
 
       const vault = (await renameVaultFolder(proj.name)) ?? picked;
 
-      // Download the project's assets from the web, then re-key them into the
+      // Download the project's assets from the web (several at once), then re-key them into the
       // vault's engine-readable scheme and write everything locally.
+      const paths = collectAssetPaths(proj);
       const bytes = new Map<string, Uint8Array>();
-      for (const p of collectAssetPaths(proj)) {
+      let fetched = 0;
+      setImportProgress({ title, step: "Downloading files", done: 0, total: paths.length });
+      await runPool(paths, 8, async (p) => {
         const b = await webPlatform.readAssetBytes(p).catch(() => null);
         if (b) bytes.set(p, b);
-      }
-      await rekeyAndUploadAssets(proj, bytes);
+        fetched += 1;
+        setImportProgress({ title, step: "Downloading files", done: fetched, total: paths.length });
+      });
+      await rekeyAndUploadAssets(proj, bytes, (done, total) =>
+        setImportProgress({ title, step: "Saving files to your vault", done, total }));
+      setImportProgress({ title, step: "Writing project files…", done: 0, total: 0 });
       await platform.saveProject(vault, proj);
       await stampSynced(projectId, uid, proj, vault, webAssetPathsFor(proj, uid), null, webForm);
 
@@ -3473,10 +3513,13 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       setActiveCollectionId(proj.collections[0]?.id ?? "");
       lastSavedJsonRef.current = JSON.stringify(proj);
       setIsDirty(false);
+      setImportProgress(null);
       await appModal.alert("Imported from your web account and linked for sync.", { title: "Imported" });
     } catch (e: any) {
+      setImportProgress(null);
       appModal.alert(e?.message ?? "Import failed.", { title: "Sync" });
     } finally {
+      setImportProgress(null);
       setLoadingInit(false);
     }
   };
@@ -3753,6 +3796,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const vault = getVaultPath();
     if (vault) await platform.saveProject(vault, localized);
     adoptSyncedProject(localized);
+    void reconcileAssetsFromDisk();
     return { project: localized, webProject };
   };
 
@@ -3784,6 +3828,7 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     const vault = getVaultPath();
     if (vault) await platform.saveProject(vault, merged);
     adoptSyncedProject(merged);
+    void reconcileAssetsFromDisk();
 
     const res = await syncPushToWeb(webProjectId, accountId, { incremental: true, project: merged, expectedUpdatedAt: webUpdatedAt });
     await stampSynced(webProjectId, accountId, merged, undefined, res.assetPaths, res.updatedAt, res.webProject);
@@ -4313,7 +4358,15 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
 
   // Re-key every asset in an imported project into the current platform's storage
   // scheme, then upload the bytes. Mutates `proj` in place.
-  const rekeyAndUploadAssets = async (proj: Project, bytes: Map<string, Uint8Array>) => {
+  // Runs `fn` over `items`, at most `limit` at a time.
+  const runPool = async <T,>(items: T[], limit: number, fn: (item: T) => Promise<void>) => {
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) await fn(items[next++]);
+    }));
+  };
+
+  const rekeyAndUploadAssets = async (proj: Project, bytes: Map<string, Uint8Array>, onProgress?: (done: number, total: number) => void) => {
     const pathMap = new Map<string, string>();
     const uploads: { oldPath: string; newPath: string; name: string; mime: string }[] = [];
 
@@ -4375,12 +4428,16 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
     if (proj.view) proj.view.worldMapImagePath = remap(proj.view.worldMapImagePath);
 
     // Upload the bytes for each unique asset.
-    for (const u of uploads) {
+    let written = 0;
+    onProgress?.(0, uploads.length);
+    await runPool(uploads, 8, async (u) => {
       const data = bytes.get(u.oldPath);
-      if (!data) continue; // missing in archive — skip rather than fail the import
-      const file = new File([data as unknown as BlobPart], u.name, { type: u.mime });
-      await platform.uploadAsset(file, u.newPath);
-    }
+      if (data) { // missing in archive — skip rather than fail the import
+        const file = new File([data as unknown as BlobPart], u.name, { type: u.mime });
+        await platform.uploadAsset(file, u.newPath);
+      }
+      onProgress?.(++written, uploads.length);
+    });
   };
 
   const triggerImportProject = async () => {
@@ -8214,6 +8271,30 @@ const App: React.FC<{ isGuest?: boolean; onRequestSignup?: () => void }> = ({
       </div>
     </div>
   ) : null;
+
+  if (importProgress) {
+    const { title, step, done, total } = importProgress;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    return (
+      <div className="app-splash">
+        <img className="app-splash-logo" src="/rpgst_logo.png" alt="" />
+        <div className="app-splash-name">{title}</div>
+        {total > 0 ? (
+          <div style={{ width: 260, height: 6, borderRadius: 6, background: "var(--splash-track)", overflow: "hidden" }}>
+            <div style={{ width: `${pct}%`, height: "100%", borderRadius: 6, background: "var(--splash-accent)", transition: "width 0.2s" }} />
+          </div>
+        ) : (
+          <div className="app-splash-bar" />
+        )}
+        <div style={{ fontSize: 13, color: "var(--splash-fg)", opacity: 0.75 }}>
+          {total > 0 ? `${step} — ${done} of ${total}` : step}
+        </div>
+        <div style={{ fontSize: 12, color: "var(--splash-fg)", opacity: 0.5, maxWidth: 320, textAlign: "center" }}>
+          Large projects can take a few minutes. Keep the app open.
+        </div>
+      </div>
+    );
+  }
 
   if (needsVaultPicker) {
     return (

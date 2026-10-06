@@ -21,7 +21,7 @@ import {
   buildDefaultFieldValues,
   ensureFieldValues,
 } from "./datasetFields";
-import { buildDatasetFile } from "./dialogueExport";
+import { buildDatasetFile, fieldLevelValue } from "./dialogueExport";
 import LinkedTextField, { type LinkableRecord } from "./editor/LinkedTextField";
 import { toSlug } from "./platform/slugify";
 import type { Project } from "./types";
@@ -50,16 +50,6 @@ const inputStyle: React.CSSProperties = {
   fontSize: 12,
   height: 28,
   boxSizing: "border-box",
-};
-
-// Small dim label that prefixes each segment of an entry row.
-const segLabelStyle: React.CSSProperties = {
-  fontSize: 10,
-  fontWeight: 700,
-  textTransform: "uppercase",
-  letterSpacing: 0.4,
-  opacity: 0.45,
-  flexShrink: 0,
 };
 
 
@@ -101,7 +91,7 @@ const TypedValueInput: React.FC<{
 };
 
 // One draggable entry card. Only the handle starts a drag, so the inputs inside stay usable.
-const SortableEntryCard: React.FC<{ id: Id; children: React.ReactNode }> = ({ id, children }) => {
+const SortableEntryCard: React.FC<{ id: Id; children: React.ReactNode; compact?: boolean }> = ({ id, children, compact }) => {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id });
   const handle = (
     <button
@@ -126,7 +116,10 @@ const SortableEntryCard: React.FC<{ id: Id; children: React.ReactNode }> = ({ id
         zIndex: isDragging ? 1 : undefined,
         opacity: isDragging ? 0.85 : 1,
         boxShadow: isDragging ? "0 6px 18px rgba(0,0,0,0.25)" : undefined,
-        border: "1px solid var(--border-2)", borderRadius: 8, background: "var(--bg-panel)", padding: "8px 10px 8px 22px", display: "flex", flexDirection: "column", gap: 6,
+        ...(compact
+          ? { borderRadius: 6, background: isDragging ? "var(--bg-panel)" : "transparent", padding: "2px 4px 2px 22px" }
+          : { border: "1px solid var(--border-2)", borderRadius: 8, background: "var(--bg-panel)", padding: "8px 10px 8px 22px" }),
+        display: "flex", flexDirection: "column", gap: 6,
       }}
     >
       {handle}
@@ -150,7 +143,23 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
-  const showJsonPreview = viewWidth === 0 || viewWidth >= 620;
+  // The JSON preview can also be hidden by hand (remembered on this device).
+  const [jsonOpen, setJsonOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem("evenstory_cond_json") !== "0"; } catch { return true; }
+  });
+  const toggleJson = () => {
+    setJsonOpen((v) => {
+      try { localStorage.setItem("evenstory_cond_json", v ? "0" : "1"); } catch { /* ignore */ }
+      return !v;
+    });
+  };
+  const showJsonPreview = jsonOpen && (viewWidth === 0 || viewWidth >= 620);
+
+  // Entries are shown in blocks: consecutive entries with the same subject and condition values share
+  // one header, so a run of lines reads as just the lines. Changing one entry's subject or a condition
+  // value splits it off into its own block.
+  const [editingGroup, setEditingGroup] = useState<Id | null>(null); // block whose header is being edited
+  const [openEntry, setOpenEntry] = useState<Id | null>(null); // one entry's own subject/conditions shown
 
   const recordOptions = useMemo(
     () =>
@@ -208,14 +217,51 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
   const removeField = (idx: number) => setFieldDefs(fieldDefs.filter((_, i) => i !== idx));
 
   // ---- Entry editing --------------------------------------------------------
+  // A new entry carries on from the last one: same subject and condition values, empty result.
   const addEntry = () => {
+    const last = dataset.entries[dataset.entries.length - 1];
     const entry: DatasetEntry = {
       id: newEntryId(),
-      fields: buildDefaultFieldValues(fieldDefs),
+      ...(last?.subjectCollectionId ? { subjectCollectionId: last.subjectCollectionId, subjectEntityId: last.subjectEntityId } : {}),
+      fields: last ? ensureFieldValues(fieldDefs, { ...last.fields }) : buildDefaultFieldValues(fieldDefs),
       result: { kind: "text", value: "" },
     };
     onChange({ ...dataset, entries: [...dataset.entries, entry] });
   };
+
+  // Another line in a block: inserted right after its last entry, with the block's subject and values.
+  const addLineToGroup = (group: DatasetEntry[]) => {
+    const last = group[group.length - 1];
+    const at = dataset.entries.findIndex((e) => e.id === last.id) + 1;
+    const entry: DatasetEntry = {
+      id: newEntryId(),
+      ...(last.subjectCollectionId ? { subjectCollectionId: last.subjectCollectionId, subjectEntityId: last.subjectEntityId } : {}),
+      fields: { ...last.fields },
+      result: { kind: "text", value: "" },
+    };
+    const entries = [...dataset.entries];
+    entries.splice(at, 0, entry);
+    onChange({ ...dataset, entries });
+  };
+
+  // Editing a block's header changes every entry in it, so the block stays together.
+  const updateGroup = (group: DatasetEntry[], patch: Partial<DatasetEntry>) => {
+    const ids = new Set(group.map((e) => e.id));
+    onChange({ ...dataset, entries: dataset.entries.map((e) => (ids.has(e.id) ? { ...e, ...patch } : e)) });
+  };
+
+  const groupKey = (e: DatasetEntry) =>
+    `${e.subjectCollectionId ?? ""}|${e.subjectEntityId ?? ""}|${JSON.stringify(fieldDefs.map((d) => e.fields?.[d.id] ?? null))}`;
+  const groups = useMemo(() => {
+    const out: DatasetEntry[][] = [];
+    for (const e of dataset.entries) {
+      const prev = out[out.length - 1];
+      if (prev && groupKey(prev[0]) === groupKey(e)) prev.push(e);
+      else out.push([e]);
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataset.entries, fieldDefs]);
 
   const updateEntry = (id: Id, patch: Partial<DatasetEntry>) =>
     onChange({ ...dataset, entries: dataset.entries.map((e) => (e.id === id ? { ...e, ...patch } : e)) });
@@ -370,6 +416,93 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
     );
   };
 
+  // Who says it: table + record selects.
+  const renderSubjectEditor = (entry: DatasetEntry, set: (patch: Partial<DatasetEntry>) => void) => {
+    const subjCol = collections.find((c) => c.id === entry.subjectCollectionId);
+    return (
+      <>
+        <select
+          className="themed-select"
+          value={entry.subjectCollectionId ?? ""}
+          onChange={(e) => {
+            const nc = collections.find((c) => c.id === e.target.value);
+            set({ subjectCollectionId: e.target.value || undefined, subjectEntityId: nc?.rows[0]?.id });
+          }}
+          style={{ ...inputStyle, width: 120 }}
+        >
+          <option value="">{t("cond.phTable")}</option>
+          {recordOptions.map((c) => (
+            <option key={c.id} value={c.id}>{c.name}</option>
+          ))}
+        </select>
+        {subjCol && (
+          <select
+            className="themed-select"
+            value={entry.subjectEntityId ?? ""}
+            onChange={(e) => set({ subjectEntityId: e.target.value || undefined })}
+            style={{ ...inputStyle, width: 120 }}
+          >
+            <option value="">{t("cond.phRecord")}</option>
+            {(subjCol.rows ?? []).map((row) => (
+              <option key={row.id} value={row.id}>{getRowLabel(row)}</option>
+            ))}
+          </select>
+        )}
+      </>
+    );
+  };
+
+  // When: one input per condition field.
+  const renderConditionEditor = (entry: DatasetEntry, set: (fields: DatasetEntry["fields"]) => void) =>
+    fieldDefs.map((def) => (
+      <label key={def.id} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, opacity: 0.85 }}>
+        <span style={{ opacity: 0.7 }}>{def.label}</span>
+        {def.type === "record" ? (
+          <select
+            className="themed-select"
+            value={String(entry.fields?.[def.id] ?? "")}
+            onChange={(e) => set({ ...entry.fields, [def.id]: e.target.value })}
+            style={{ ...inputStyle, width: 120 }}
+          >
+            <option value="">{t("cond.phRecord")}</option>
+            {(collections.find((c) => c.id === def.collectionId)?.rows ?? []).map((row) => (
+              <option key={row.id} value={row.id}>{getRowLabel(row)}</option>
+            ))}
+          </select>
+        ) : (
+          <TypedValueInput
+            type={def.type}
+            value={entry.fields?.[def.id] ?? (def.type === "number" ? 1 : def.type === "bool" ? "false" : "")}
+            width={def.type === "number" ? 56 : 100}
+            onChange={(v) => set({ ...entry.fields, [def.id]: v })}
+          />
+        )}
+      </label>
+    ));
+
+  // A record field's value as people read it: the record's label (its Name, or its ID).
+  const recordLabel = (def: DatasetFieldDef, raw: string | number | undefined) => {
+    const row = collections.find((c) => c.id === def.collectionId)?.rows.find((r) => r.id === raw);
+    return row ? getRowLabel(row) : raw ? fieldLevelValue(collections, def, raw) : "—";
+  };
+
+  // The block header at rest: "BROTHER · Act 1 · Chapter 1 · Stage 2 · Interaction 1".
+  const renderSummary = (entry: DatasetEntry) => {
+    const subjCol = collections.find((c) => c.id === entry.subjectCollectionId);
+    const subjRow = subjCol?.rows.find((r) => r.id === entry.subjectEntityId);
+    const chip: React.CSSProperties = { fontSize: 12, padding: "2px 7px", borderRadius: 10, background: "var(--bg-surface)", border: "1px solid var(--border-2)", whiteSpace: "nowrap" };
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap", minWidth: 0 }}>
+        <span style={{ fontWeight: 700, fontSize: 13 }}>{subjRow ? getRowLabel(subjRow) : t("cond.noSubject", "(no subject)")}</span>
+        {fieldDefs.map((def) => (
+          <span key={def.id} style={chip}>
+            <span style={{ opacity: 0.6 }}>{def.label}</span> <b>{def.type === "record" ? recordLabel(def, entry.fields?.[def.id]) : String(entry.fields?.[def.id] ?? "")}</b>
+          </span>
+        ))}
+      </div>
+    );
+  };
+
   return (
     <div ref={rootRef} style={{ height: "100%", padding: "12px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", minHeight: 0, gap: 10 }}>
       {/* Header */}
@@ -418,13 +551,33 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
               <select
                 className="themed-select"
                 value={def.type}
-                onChange={(e) => updateField(idx, { type: e.target.value as DatasetFieldType })}
+                onChange={(e) => {
+                  const type = e.target.value as DatasetFieldDef["type"];
+                  updateField(idx, type === "record"
+                    ? { type, collectionId: def.collectionId ?? collections[0]?.id, defaultValue: undefined }
+                    : { type, collectionId: undefined, defaultValue: undefined });
+                }}
                 style={{ ...inputStyle, width: 84 }}
               >
                 <option value="number">{t("cond.typeNumber")}</option>
                 <option value="string">{t("cond.typeString")}</option>
                 <option value="bool">{t("cond.typeBool")}</option>
+                <option value="record">{t("cond.typeRecord", "Record")}</option>
               </select>
+              {def.type === "record" && (
+                <select
+                  className="themed-select"
+                  value={def.collectionId ?? ""}
+                  onChange={(e) => updateField(idx, { collectionId: e.target.value || undefined })}
+                  title={t("cond.recordTable", "Which table this field's records come from")}
+                  style={{ ...inputStyle, width: 110 }}
+                >
+                  <option value="">{t("cond.phTable")}</option>
+                  {recordOptions.map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              )}
               <button
                 type="button"
                 onClick={() => removeField(idx)}
@@ -444,84 +597,74 @@ const DatasetView: React.FC<Props> = ({ dataset, collections, onChange, onRename
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", minHeight: 0 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
             <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.85 }}>{t("cond.entries")} ({dataset.entries.length})</div>
-            <button type="button" onClick={addEntry} style={{ ...inputStyle, cursor: "pointer" }}>{t("cond.addEntry")}</button>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button type="button" onClick={toggleJson} style={{ ...inputStyle, cursor: "pointer" }}>
+                {jsonOpen ? t("cond.hideJson", "Hide JSON") : t("cond.showJson", "Show JSON")}
+              </button>
+              <button type="button" onClick={addEntry} style={{ ...inputStyle, cursor: "pointer" }}>{t("cond.addEntry")}</button>
+            </div>
           </div>
 
-          <div style={{ flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 4, paddingRight: 4 }}>
+          <div style={{ flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 4 }}>
             {dataset.entries.length === 0 && (
               <div style={{ fontSize: 12, opacity: 0.6, padding: "8px 0" }}>No entries yet. Add one to map fields to a result.</div>
             )}
             <DndContext sensors={entrySensors} collisionDetection={closestCenter} onDragEnd={onEntryDragEnd}>
             <SortableContext items={dataset.entries.map((e) => e.id)} strategy={verticalListSortingStrategy}>
-            {dataset.entries.map((entry) => {
-              const subjCol = collections.find((c) => c.id === entry.subjectCollectionId);
+            {groups.map((group) => {
+              const head = group[0];
+              const editing = editingGroup === head.id;
               return (
-                <SortableEntryCard key={entry.id} id={entry.id}>
-                  {/* Subject */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                    <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.subject")}</span>
-                    <select
-                      className="themed-select"
-                      value={entry.subjectCollectionId ?? ""}
-                      onChange={(e) => {
-                        const nc = collections.find((c) => c.id === e.target.value);
-                        updateEntry(entry.id, { subjectCollectionId: e.target.value || undefined, subjectEntityId: nc?.rows[0]?.id });
-                      }}
-                      style={{ ...inputStyle, width: 130 }}
-                    >
-                      <option value="">{t("cond.phTable")}</option>
-                      {recordOptions.map((c) => (
-                        <option key={c.id} value={c.id}>{c.name}</option>
-                      ))}
-                    </select>
-                    {/* The record select only appears once a table is chosen. */}
-                    {subjCol && (
-                      <select
-                        className="themed-select"
-                        value={entry.subjectEntityId ?? ""}
-                        onChange={(e) => updateEntry(entry.id, { subjectEntityId: e.target.value || undefined })}
-                        style={{ ...inputStyle, width: 130 }}
-                      >
-                        <option value="">{t("cond.phRecord")}</option>
-                        {(subjCol.rows ?? []).map((row) => (
-                          <option key={row.id} value={row.id}>{getRowLabel(row)}</option>
-                        ))}
-                      </select>
+                <div key={head.id} style={{ border: "1px solid var(--border-2)", borderRadius: 8, background: "var(--bg-panel)", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 4 }}>
+                  {/* Block header: who and when, once for every line under it */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", minHeight: 26 }}>
+                    {editing ? (
+                      <>
+                        {renderSubjectEditor(head, (patch) => updateGroup(group, patch))}
+                        {renderConditionEditor(head, (fields) => updateGroup(group, { fields }))}
+                      </>
+                    ) : (
+                      renderSummary(head)
                     )}
-
-                    <button
-                      type="button"
-                      onClick={() => removeEntry(entry.id)}
-                      title={t("cond.removeEntry")}
-                      style={{ marginLeft: "auto", ...inputStyle, width: 26, padding: 0, border: "1px solid var(--danger-border)", background: "var(--danger-bg)", color: "var(--danger-text)", cursor: "pointer" }}
-                    >
-                      ✕
-                    </button>
+                    <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+                      <button type="button" className="iconBtn" onClick={() => setEditingGroup(editing ? null : head.id)}
+                        title={editing ? t("cond.doneEditing", "Done") : t("cond.editBlock", "Change the subject / conditions of these lines")}>
+                        {editing ? "✓" : "✎"}
+                      </button>
+                      <button type="button" onClick={() => addLineToGroup(group)} title={t("cond.addLine", "Add a line here")}
+                        style={{ ...inputStyle, height: 24, padding: "0 8px", cursor: "pointer" }}>
+                        {t("cond.addLineShort", "+ Line")}
+                      </button>
+                    </div>
                   </div>
-
-                  {/* Condition (field values) */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.condition")}</span>
-                    {fieldDefs.length === 0 && <span style={{ fontSize: 12, opacity: 0.4 }}>(none)</span>}
-                    {fieldDefs.map((def) => (
-                      <label key={def.id} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, opacity: 0.85 }}>
-                        <span style={{ opacity: 0.7 }}>{def.label}</span>
-                        <TypedValueInput
-                          type={def.type}
-                          value={entry.fields?.[def.id] ?? (def.type === "number" ? 1 : def.type === "bool" ? "false" : "")}
-                          width={def.type === "number" ? 60 : 100}
-                          onChange={(v) => updateEntry(entry.id, { fields: { ...entry.fields, [def.id]: v } })}
-                        />
-                      </label>
-                    ))}
-                  </div>
-
-                  {/* Result */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                    <span style={{ ...segLabelStyle, width: 66 }}>{t("cond.result")}</span>
-                    {renderResultEditor(entry)}
-                  </div>
-                </SortableEntryCard>
+                  {/* The lines */}
+                  {group.map((entry) => (
+                    <SortableEntryCard key={entry.id} id={entry.id} compact>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        {renderResultEditor(entry)}
+                        <button type="button" className="iconBtn" onClick={() => setOpenEntry(openEntry === entry.id ? null : entry.id)}
+                          title={t("cond.entryDetails", "This line's own subject / conditions (changing them splits it off)")}
+                          style={{ opacity: openEntry === entry.id ? 1 : 0.5 }}>
+                          ⋯
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeEntry(entry.id)}
+                          title={t("cond.removeEntry")}
+                          style={{ ...inputStyle, width: 24, height: 24, padding: 0, border: "1px solid var(--danger-border)", background: "var(--danger-bg)", color: "var(--danger-text)", cursor: "pointer", flexShrink: 0 }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      {openEntry === entry.id && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", padding: "4px 0 2px" }}>
+                          {renderSubjectEditor(entry, (patch) => updateEntry(entry.id, patch))}
+                          {renderConditionEditor(entry, (fields) => updateEntry(entry.id, { fields }))}
+                        </div>
+                      )}
+                    </SortableEntryCard>
+                  ))}
+                </div>
               );
             })}
             </SortableContext>

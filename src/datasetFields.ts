@@ -49,7 +49,7 @@ export const buildDefaultFieldValues = (defs: DatasetFieldDef[]): Record<string,
     if (def.defaultValue !== undefined) {
       out[def.id] = def.defaultValue;
     } else {
-      out[def.id] = def.type === "number" ? 1 : def.type === "bool" ? "false" : "";
+      out[def.id] = def.type === "number" ? 1 : def.type === "bool" ? "false" : ""; // record: none picked yet
     }
   }
   return out;

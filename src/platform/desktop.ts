@@ -413,6 +413,85 @@ export async function vaultAssetExists(storagePath: string, vault?: string): Pro
 
 // ── Asset helpers ──────────────────────────────────────────────────────────
 
+// ── Vault asset reconcile ──────────────────────────────────────────────────
+// Files are often added straight into a record's folder in the vault (assets/<table>/<record ID>/,
+// any depth) instead of through Upload. These keep the project's asset lists matching the disk:
+// listVaultAssetFiles() reads what's there, reconcileVaultAssets() attaches anything new to its record
+// and repoints an entry whose file has moved (same name, elsewhere in the same record's folder) —
+// keeping the entry's id, so a record's icon still points at it.
+
+// Engine sidecar files that sit next to assets but aren't assets (Godot .import / .uid, Unity .meta).
+const SIDECAR_FILE = /\.(import|uid|meta|tmp)$|^thumbs\.db$|^desktop\.ini$/i;
+
+// Every file under the vault's assets/ folder: [path relative to assets/, size].
+export async function listVaultAssetFiles(vault?: string): Promise<Array<[string, number]>> {
+  const v = vault ?? getVaultPath();
+  if (!v) return [];
+  const files = await invoke<Array<[string, number]>>('list_files_recursive', { path: joinPath(v, 'assets') })
+    .catch(() => [] as Array<[string, number]>);
+  return files.filter(([p]) => !SIDECAR_FILE.test(p.split('/').pop() ?? ''));
+}
+
+// The project with its asset lists matched to `files` (from listVaultAssetFiles), or null if nothing
+// needed changing. Only records' own folders are looked at; a file outside every record's folder is
+// left alone. Entries whose file is missing and can't be found are kept as they are.
+export function reconcileVaultAssets(project: Project, files: Array<[string, number]>): Project | null {
+  const sizes = new Map(files);
+  const colSlugs = (project.collections ?? []).map((c) => colVaultSegments(c.folderPath, c.name).join('/'));
+  let changed = false;
+  const collections = (project.collections ?? []).map((col, ci) => {
+    if (col.assetsEnabled === false) return col;
+    const colSlug = colSlugs[ci];
+    // A deeper table's folder nested under this one (world/ vs world/locations/) isn't this table's.
+    const deeper = colSlugs.filter((s) => s !== colSlug && s.startsWith(colSlug + '/'));
+    let colChanged = false;
+    const rows = (col.rows ?? []).map((row) => {
+      const entityKey = String(row.values?.['id'] ?? '') || String(row.id ?? '');
+      if (!entityKey) return row;
+      const folder = `${colSlug}/${entityKey}/`;
+      const here = files
+        .map(([p]) => p)
+        .filter((p) => p.startsWith(folder) && !deeper.some((d) => p.startsWith(d + '/')));
+      const assets = [...(row.assets ?? [])];
+      const claimed = new Set(assets.map((a) => a.path).filter((p) => sizes.has(p)));
+      let rowChanged = false;
+      // Moved: same file name, now somewhere else in this record's folder.
+      for (let i = 0; i < assets.length; i++) {
+        const a = assets[i];
+        if (sizes.has(a.path)) continue;
+        const name = a.name || a.path.split('/').pop() || '';
+        const found = here.find((p) => !claimed.has(p) && p.split('/').pop() === name);
+        if (found) {
+          assets[i] = { ...a, path: found };
+          claimed.add(found);
+          rowChanged = true;
+        }
+      }
+      // New: in the folder, not on the record yet.
+      for (const p of here) {
+        if (claimed.has(p)) continue;
+        assets.push({
+          id: crypto.randomUUID(),
+          name: p.split('/').pop() ?? p,
+          mime: guessMime(p),
+          size: sizes.get(p) ?? 0,
+          path: p,
+          createdAt: new Date().toISOString(),
+        });
+        claimed.add(p);
+        rowChanged = true;
+      }
+      if (!rowChanged) return row;
+      colChanged = true;
+      return { ...row, assets };
+    });
+    if (!colChanged) return col;
+    changed = true;
+    return { ...col, rows };
+  });
+  return changed ? { ...project, collections } : null;
+}
+
 function vaultAssetPath(vault: string, storagePath: string): string {
   return joinPath(vault, "assets", storagePath);
 }
